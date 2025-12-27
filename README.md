@@ -119,7 +119,9 @@ python -m momentum_backtest \
   --end 2024-12-31 \
   --panic-defensive-mode \
   --panic-vol-ratio 1.5 \
+  --defensive-basket-size 20 \
   --cash-rate-annual 0.05 \
+  --tc-bps 10 \
   --output-dir output/v2_recommended
 ```
 
@@ -291,13 +293,14 @@ python -m momentum_backtest \
   --start 2016-01-01 --end 2024-12-31 \
   --panic-defensive-mode \
   --panic-vol-ratio 1.5 \
+  --defensive-basket-size 20 \
   --cash-rate-annual 0.05 \
   --tc-bps 10 \
   --output-dir output/balanced
 ```
-- Defensive momentum during stress periods
+- Defensive momentum during stress periods (20 low-vol stocks)
 - 5% cash yield assumption
-- More responsive to volatility spikes
+- More responsive to volatility spikes (1.5 threshold catches 7 events vs 1 at default 2.0)
 
 ### Aggressive
 ```bash
