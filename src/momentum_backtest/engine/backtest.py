@@ -13,6 +13,7 @@ CRITICAL: All return computations use EXCLUSIVE end boundaries to prevent lookah
 """
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional
 import logging
 
@@ -525,12 +526,14 @@ def run_backtest(
         logger.debug(f"  State={current_state.name}, Equity={equity:.4f}, "
                      f"Stocks={len(selected_tickers)}, Turnover={turnover:.2%}")
 
-    # Step 7: Fill in daily equity curve between rebalances
+    # Step 7: Fill in daily equity curve between rebalances (through end date)
     daily_equity = _build_daily_equity(
         equity_curve,
         price_data,
         rebalance_records,
         trading_dates,
+        config.end_date,
+        config.cash_rate_annual,
     )
 
     # Step 8: Compute summary statistics
@@ -590,17 +593,21 @@ def _build_daily_equity(
     price_data: pd.DataFrame,
     records: List[RebalanceRecord],
     trading_dates: pd.DatetimeIndex,
+    backtest_end_date: date,
+    cash_rate_annual: float = 0.0,
 ) -> pd.Series:
     """
     Build daily equity curve by interpolating between rebalances.
 
-    Uses the same EXCLUSIVE end boundary rule for consistency.
+    Extends through backtest_end_date to capture returns after the last rebalance.
 
     Args:
         rebalance_equity: Equity at each rebalance date
         price_data: Stock price DataFrame
         records: Rebalance records with weights
         trading_dates: Trading calendar
+        backtest_end_date: Configured end date for the backtest
+        cash_rate_annual: Annualized cash yield for periods in cash
 
     Returns:
         Daily equity curve
@@ -609,9 +616,9 @@ def _build_daily_equity(
         return pd.Series(dtype=float)
 
     # Filter trading dates to backtest period
-    # Use < for end to be consistent with exclusive boundary
+    # Extend through backtest_end_date to capture returns after last rebalance
     start_date = records[0].date
-    end_date = records[-1].date
+    end_date = pd.Timestamp(backtest_end_date)
     period_dates = trading_dates[
         (trading_dates >= start_date) & (trading_dates <= end_date)
     ]
@@ -623,13 +630,16 @@ def _build_daily_equity(
     current_equity = 1.0
     record_idx = 0
 
-    for i, date in enumerate(period_dates):
+    # Daily cash yield (convert annual to daily)
+    daily_cash_yield = cash_rate_annual / 252.0 if cash_rate_annual > 0 else 0.0
+
+    for i, current_date in enumerate(period_dates):
         # Check if this is a rebalance date
-        if record_idx < len(records) and date >= records[record_idx].date:
+        if record_idx < len(records) and current_date >= records[record_idx].date:
             current_equity = rebalance_equity.get(records[record_idx].date, current_equity)
             current_weights = records[record_idx].weights.copy()
             record_idx += 1
-            daily_equity[date] = current_equity
+            daily_equity[current_date] = current_equity
 
         elif current_weights and i > 0:
             # Interpolate based on portfolio performance
@@ -638,12 +648,18 @@ def _build_daily_equity(
 
             # Use pure function for daily return (Fix 5)
             day_return = compute_daily_return(
-                price_data, current_weights, prev_date, date
+                price_data, current_weights, prev_date, current_date
             )
-            daily_equity[date] = update_equity(prev_equity, day_return)
+            daily_equity[current_date] = update_equity(prev_equity, day_return)
+
+        elif i > 0:
+            # In cash - apply daily cash yield
+            prev_date = period_dates[i - 1]
+            prev_equity = daily_equity.get(prev_date, current_equity)
+            daily_equity[current_date] = prev_equity * (1 + daily_cash_yield)
 
         else:
-            # In cash or first day - flat equity
-            daily_equity[date] = current_equity
+            # First day
+            daily_equity[current_date] = current_equity
 
     return daily_equity.dropna()
