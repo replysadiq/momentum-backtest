@@ -612,7 +612,9 @@ def run_backtest(
                 not_in_price_data=0,
             ))
 
-        # Step 6a: V4 Breadth overlay - scale weights if enabled and invested
+        # Step 6a: V4 Breadth overlay - sample breadth at rebalance (apply during return calc)
+        # Key fix: Breadth scaling is applied during daily return calculation, NOT to weights.
+        # This prevents artificial turnover from breadth changes between rebalances.
         breadth_raw_val: Optional[float] = None
         breadth_smooth_val: Optional[float] = None
         breadth_conf_val: Optional[float] = None
@@ -631,36 +633,18 @@ def run_backtest(
                 breadth_smooth_val = float(breadth_series.breadth_smooth[rebalance_date])
             breadth_conf_val = get_breadth_confidence(breadth_series, rebalance_date)
 
-            # Apply breadth scaling only to invested states
-            if invested_flag and new_weights:
-                # Scale weights by breadth confidence (remainder goes to cash)
-                scaled_weights = scale_weights_by_breadth(new_weights, breadth_conf_val)
+            # Apply breadth scaling only to RISK_ON and DEFENSIVE_MOMENTUM states
+            # CASH state ignores breadth (even with defensive replacement)
+            if invested_flag and current_state != MarketState.CASH:
                 final_exposure = base_exposure * breadth_conf_val
-
-                # Recompute turnover with scaled weights (vs previous scaled weights)
-                target_weights_series = pd.Series(scaled_weights) if scaled_weights else pd.Series(dtype=float)
-                turnover = compute_turnover(prev_weights_series, target_weights_series)
-
-                # Apply transaction costs for any change from scaling
-                if turnover > 0:
-                    additional_tc = apply_transaction_cost(0.0, turnover, config.tc_bps)
-                    transaction_cost = abs(additional_tc)
-                    equity = update_equity(equity, -abs(additional_tc))
-                    equity_curve[rebalance_date] = equity
-
-                # Track turnover by state
-                if current_state == MarketState.RISK_ON:
-                    turnover_risk_on += turnover
-                elif current_state in (MarketState.DEFENSIVE_MOMENTUM, MarketState.CASH):
-                    turnover_defensive += turnover
-
-                new_weights = scaled_weights
-                selected_tickers = list(new_weights.keys())
 
                 raw_str = f"{breadth_raw_val:.3f}" if breadth_raw_val is not None else "N/A"
                 smooth_str = f"{breadth_smooth_val:.3f}" if breadth_smooth_val is not None else "N/A"
                 logger.debug(f"  Breadth: raw={raw_str}, smooth={smooth_str}, "
                             f"conf={breadth_conf_val:.3f}, exposure={final_exposure:.2%}")
+
+        # Note: Weights are NOT scaled here. Breadth scaling happens in _build_daily_equity
+        # Turnover is calculated on base weights (already done above)
 
         # Step 6b: Record rebalance event
         # Capture cash_entry_reason from context (only set when entering CASH)
@@ -779,6 +763,10 @@ def _build_daily_equity(
 
     Extends through backtest_end_date to capture returns after the last rebalance.
 
+    V4: Applies breadth-based exposure scaling during return calculation.
+    The final_exposure from each rebalance record is held constant until the next rebalance.
+    Actual return = stock_return * final_exposure + cash_return * (1 - final_exposure)
+
     Args:
         rebalance_equity: Equity at each rebalance date
         price_data: Stock price DataFrame
@@ -806,6 +794,7 @@ def _build_daily_equity(
     # Fill in equity for each day
     current_weights: Dict[str, float] = {}
     current_equity = 1.0
+    current_exposure = 1.0  # V4: exposure scalar, held constant between rebalances
     record_idx = 0
 
     # Daily cash yield (convert annual to daily)
@@ -816,6 +805,8 @@ def _build_daily_equity(
         if record_idx < len(records) and current_date >= records[record_idx].date:
             current_equity = rebalance_equity.get(records[record_idx].date, current_equity)
             current_weights = records[record_idx].weights.copy()
+            # V4: Update exposure from rebalance record (held constant until next rebalance)
+            current_exposure = records[record_idx].final_exposure
             record_idx += 1
             daily_equity[current_date] = current_equity
 
@@ -825,9 +816,18 @@ def _build_daily_equity(
             prev_equity = daily_equity.get(prev_date, current_equity)
 
             # Use pure function for daily return (Fix 5)
-            day_return = compute_daily_return(
+            stock_return = compute_daily_return(
                 price_data, current_weights, prev_date, current_date
             )
+
+            # V4: Apply breadth-based exposure scaling
+            # actual_return = stock_return * exposure + cash_return * (1 - exposure)
+            if current_exposure < 1.0:
+                cash_return = daily_cash_yield
+                day_return = stock_return * current_exposure + cash_return * (1.0 - current_exposure)
+            else:
+                day_return = stock_return
+
             daily_equity[current_date] = update_equity(prev_equity, day_return)
 
         elif i > 0:
