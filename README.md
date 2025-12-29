@@ -232,7 +232,7 @@ Date,Close
 
 ## Usage
 
-### Recommended Configuration (V3.1)
+### Recommended Configuration (V4)
 
 ```bash
 python -m momentum_backtest \
@@ -248,7 +248,12 @@ python -m momentum_backtest \
   --cash-replace-mode defensive \
   --tc-bps 10 \
   --comparison-benchmark-csv data/nifty500_momentum50_benchmark.csv \
-  --output-dir output/v3_recommended
+  --output-dir output/v4_recommended
+```
+
+**Note:** V4 breadth overlay is enabled by default. To disable it:
+```bash
+--enable-breadth-overlay false
 ```
 
 ### Command Line Options
@@ -347,6 +352,52 @@ When `--cash-replace-mode defensive`:
 - `invested_flag=True` in state_log.csv
 - `time_in_cash_invested` reported in metrics.json
 
+### V4: Breadth Overlay (Default Enabled)
+
+The breadth overlay provides **continuous exposure scaling** based on market breadth, acting as an early warning system that de-risks before regime triggers fire.
+
+**How it works:**
+```
+FinalExposure = BaseExposure × BreadthConfidence
+```
+
+Where:
+- **BaseExposure**: 1.0 when invested, 0.0 when in cash
+- **BreadthConfidence**: Scalar in [0, 1] derived from market breadth
+
+**Breadth Calculation:**
+1. `breadth_raw`: Fraction of stocks with positive 63-day return
+2. `breadth_smooth`: EMA smoothing (span=10) to reduce noise
+3. `breadth_confidence`: Linear mapping of smoothed breadth to [0, 1]
+   - Below `breadth_low` (0.35) → confidence = 0 (full de-risk)
+   - Above `breadth_high` (0.65) → confidence = 1 (full exposure)
+   - Between thresholds → linear interpolation
+
+**Key Properties:**
+- **No lookahead bias**: Breadth at t uses only prices through t-1
+- **Robust data handling**: Minimum coverage threshold, carry-forward for missing data
+- **Additive to regimes**: Breadth overlay complements (not replaces) the state machine
+
+**CLI Options:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--enable-breadth-overlay` | true | Enable V4 breadth overlay |
+| `--breadth-lookback` | 63 | Trading days for return calculation |
+| `--breadth-ema-span` | 10 | EMA smoothing span |
+| `--breadth-low` | 0.35 | Breadth below this = confidence 0 |
+| `--breadth-high` | 0.65 | Breadth above this = confidence 1 |
+| `--breadth-min-coverage` | 0.60 | Minimum fraction of stocks required |
+
+**To reproduce legacy (pre-V4) behavior:**
+```bash
+--enable-breadth-overlay false
+```
+
+**Output Files:**
+- `breadth_series.csv`: Daily breadth values (raw, smoothed, confidence, coverage)
+- `state_log.csv`: Now includes breadth columns (breadth_raw, breadth_smooth, breadth_confidence, base_exposure, final_exposure)
+
 ### State Thresholds
 
 | Parameter | Value | Description |
@@ -392,8 +443,9 @@ A stock must pass all filters to be eligible:
 | `capture_ratios.csv` | Monthly capture ratio time series |
 | `equity_curve.csv` | Daily equity values |
 | `rebalance_log.csv` | Holdings and trades at each rebalance |
-| `state_log.csv` | State transitions with `invested_flag` |
+| `state_log.csv` | State transitions with `invested_flag` and V4 breadth columns |
 | `holdings_snapshot.csv` | Detailed holdings at each rebalance |
+| `breadth_series.csv` | V4: Daily breadth values (raw, smoothed, confidence) |
 | `rolling_excess_3y_vs_benchmark.csv` | Rolling 3-year excess return |
 | `run_manifest.json` | Full configuration for reproducibility |
 
@@ -439,6 +491,7 @@ momentum_no_indicator/
 │       │   └── universe.py      # Stock universe
 │       ├── engine/
 │       │   ├── backtest.py      # Main backtest loop
+│       │   ├── breadth.py       # V4: Breadth overlay
 │       │   ├── portfolio.py     # Portfolio construction
 │       │   ├── signals.py       # Momentum scoring
 │       │   ├── state_machine.py # State transitions

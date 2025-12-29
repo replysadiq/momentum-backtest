@@ -118,9 +118,21 @@ class BacktestConfig:
     # V3.1: Cash replacement mode (none, defensive)
     cash_replace_mode: CashReplaceMode = CashReplaceMode.NONE
 
+    # === V4: Breadth Overlay ===
+    # Breadth-based exposure scaling - de-risks earlier in weakening markets
+    enable_breadth_overlay: bool = True  # Default enabled (new baseline behavior)
+    breadth_lookback: int = 63  # Trading days for return calculation
+    breadth_ema_span: int = 10  # EMA smoothing span
+    breadth_low: float = 0.35  # Breadth below this = confidence 0 (full de-risk)
+    breadth_high: float = 0.65  # Breadth above this = confidence 1 (full exposure)
+    breadth_min_coverage: float = 0.60  # Minimum fraction of stocks required
+
     @property
     def strategy_version(self) -> str:
         """Compute strategy version based on enabled levers."""
+        # V4: breadth overlay enabled
+        if self.enable_breadth_overlay:
+            return "v4"
         # V3.1: cash_replace_mode != none
         if self.cash_replace_mode != CashReplaceMode.NONE:
             return "v3.1"
@@ -139,7 +151,7 @@ class BacktestConfig:
 
     @property
     def enabled_levers(self) -> List[str]:
-        """List of enabled V2/V3 levers for logging."""
+        """List of enabled V2/V3/V4 levers for logging."""
         levers = []
         if self.panic_defensive_mode:
             levers.append(f"A:defensive_momentum(n={self.defensive_basket_size})")
@@ -155,6 +167,9 @@ class BacktestConfig:
         # V3.1: cash replace mode
         if self.cash_replace_mode != CashReplaceMode.NONE:
             levers.append(f"V3.1:cash_replace({self.cash_replace_mode.value})")
+        # V4: breadth overlay
+        if self.enable_breadth_overlay:
+            levers.append(f"V4:breadth(lookback={self.breadth_lookback},ema={self.breadth_ema_span})")
         return levers
 
     def __post_init__(self) -> None:
@@ -200,6 +215,20 @@ class BacktestConfig:
         # Validate rebalance_months
         if self.rebalance_months not in (1, 2, 3):
             raise ValueError(f"rebalance_months must be 1, 2, or 3, got {self.rebalance_months}")
+
+        # Validate breadth overlay parameters
+        if self.breadth_lookback < 10 or self.breadth_lookback > 252:
+            raise ValueError(f"breadth_lookback must be in [10, 252], got {self.breadth_lookback}")
+        if self.breadth_ema_span < 1 or self.breadth_ema_span > 50:
+            raise ValueError(f"breadth_ema_span must be in [1, 50], got {self.breadth_ema_span}")
+        if not (0 < self.breadth_low < 1):
+            raise ValueError(f"breadth_low must be in (0, 1), got {self.breadth_low}")
+        if not (0 < self.breadth_high < 1):
+            raise ValueError(f"breadth_high must be in (0, 1), got {self.breadth_high}")
+        if self.breadth_low >= self.breadth_high:
+            raise ValueError(f"breadth_low ({self.breadth_low}) must be < breadth_high ({self.breadth_high})")
+        if not (0 < self.breadth_min_coverage <= 1):
+            raise ValueError(f"breadth_min_coverage must be in (0, 1], got {self.breadth_min_coverage}")
 
     @property
     def tc_fraction(self) -> float:

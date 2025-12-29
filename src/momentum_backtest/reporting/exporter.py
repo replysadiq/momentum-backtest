@@ -10,6 +10,7 @@ Produces:
 - drawdown_attribution.csv: Worst drawdown analysis
 - holdings_snapshot.csv: Complete holdings at each rebalance
 - eligibility_coverage.csv: Stock filtering breakdown
+- breadth_series.csv: V4 daily breadth overlay series (if enabled)
 """
 
 from dataclasses import asdict
@@ -109,6 +110,10 @@ def export_results(
     if result.eligibility_records:
         export_eligibility_coverage(result.eligibility_records, output_dir)
 
+    # V4: Breadth series (if enabled)
+    if result.breadth_series is not None:
+        _export_breadth_series(result.breadth_series, output_dir)
+
     logger.info("Export complete")
 
 
@@ -188,7 +193,7 @@ def _export_state_log(
         if prev_state is not None and prev_state != record.state:
             transition = f"{prev_state.name}->{record.state.name}"
 
-        rows.append({
+        row = {
             "date": record.date.strftime("%Y-%m-%d"),
             "state": record.state.name,
             "transition": transition,
@@ -200,7 +205,14 @@ def _export_state_log(
             "benchmark_vol_6m": record.features.benchmark_vol_6m,
             "vol_ratio": record.features.vol_ratio,
             "portfolio_drawdown_3m": record.features.portfolio_drawdown_3m,
-        })
+            # V4: Breadth overlay columns
+            "breadth_raw": record.breadth_raw,
+            "breadth_smooth": record.breadth_smooth,
+            "breadth_confidence": record.breadth_confidence,
+            "base_exposure": record.base_exposure,
+            "final_exposure": record.final_exposure,
+        }
+        rows.append(row)
 
         prev_state = record.state
 
@@ -236,6 +248,42 @@ def _export_metrics(
         json.dump(metrics_dict, f, indent=2)
 
     logger.info(f"  Wrote {filepath}")
+
+
+def _export_breadth_series(
+    breadth_series: "BreadthSeries",
+    output_dir: Path,
+) -> None:
+    """
+    Export daily breadth series to CSV.
+
+    Columns:
+    - date: Trading date
+    - breadth_raw: Raw fraction of stocks with positive 63d return
+    - breadth_smooth: EMA-smoothed breadth
+    - breadth_confidence: Confidence scalar in [0, 1]
+    - coverage: Fraction of stocks with valid data
+    """
+    from ..engine.breadth import BreadthSeries
+
+    df = pd.DataFrame({
+        "date": breadth_series.breadth_raw.index,
+        "breadth_raw": breadth_series.breadth_raw.values,
+        "breadth_smooth": breadth_series.breadth_smooth.values,
+        "breadth_confidence": breadth_series.breadth_confidence.values,
+        "coverage": breadth_series.coverage.values,
+    })
+
+    # Format date
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+
+    # Round numeric columns for readability
+    for col in ["breadth_raw", "breadth_smooth", "breadth_confidence", "coverage"]:
+        df[col] = df[col].round(4)
+
+    filepath = output_dir / "breadth_series.csv"
+    df.to_csv(filepath, index=False)
+    logger.info(f"  Wrote {filepath} ({len(df)} rows)")
 
 
 def _export_run_manifest(
@@ -303,6 +351,16 @@ def _export_run_manifest(
             "rank_buffer": config.rank_buffer,
             "min_hold_months": config.min_hold_months,
             "disable_6m_filter": config.disable_6m_filter,
+        },
+
+        # V4: Breadth overlay
+        "v4_breadth_overlay": {
+            "enabled": config.enable_breadth_overlay,
+            "lookback": config.breadth_lookback,
+            "ema_span": config.breadth_ema_span,
+            "low": config.breadth_low,
+            "high": config.breadth_high,
+            "min_coverage": config.breadth_min_coverage,
         },
 
         # Data computation notes

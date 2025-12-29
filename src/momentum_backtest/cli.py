@@ -268,6 +268,48 @@ Examples:
              "(default: none)",
     )
 
+    # === V4 Breadth Overlay ===
+    v4_group = parser.add_argument_group("V4 Breadth Overlay")
+
+    v4_group.add_argument(
+        "--enable-breadth-overlay",
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        metavar="BOOL",
+        help="V4: Enable breadth-based exposure scaling (default: true). "
+             "Set to 'false' to reproduce legacy behavior exactly.",
+    )
+    v4_group.add_argument(
+        "--breadth-lookback",
+        type=int,
+        default=63,
+        help="Trading days for breadth return calculation (default: 63)",
+    )
+    v4_group.add_argument(
+        "--breadth-ema-span",
+        type=int,
+        default=10,
+        help="EMA smoothing span for breadth (default: 10)",
+    )
+    v4_group.add_argument(
+        "--breadth-low",
+        type=float,
+        default=0.35,
+        help="Breadth below this = confidence 0 (default: 0.35)",
+    )
+    v4_group.add_argument(
+        "--breadth-high",
+        type=float,
+        default=0.65,
+        help="Breadth above this = confidence 1 (default: 0.65)",
+    )
+    v4_group.add_argument(
+        "--breadth-min-coverage",
+        type=float,
+        default=0.60,
+        help="Minimum fraction of stocks required for breadth calc (default: 0.60)",
+    )
+
     return parser.parse_args(args)
 
 
@@ -330,6 +372,13 @@ def build_config(args: argparse.Namespace) -> BacktestConfig:
         "cash_entry_mode": CashEntryMode(args.cash_entry_mode),
         # V3.1 levers
         "cash_replace_mode": CashReplaceMode(args.cash_replace_mode),
+        # V4 breadth overlay
+        "enable_breadth_overlay": args.enable_breadth_overlay,
+        "breadth_lookback": args.breadth_lookback,
+        "breadth_ema_span": args.breadth_ema_span,
+        "breadth_low": args.breadth_low,
+        "breadth_high": args.breadth_high,
+        "breadth_min_coverage": args.breadth_min_coverage,
     }
 
     # Add dates if specified

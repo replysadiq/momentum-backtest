@@ -113,9 +113,10 @@ def validate_weights_sum(
     tolerance: float = 1e-6,
 ) -> None:
     """
-    Assert that weights sum to 1 (invested) or 0 (not invested).
+    Assert that weights sum correctly based on exposure.
 
     V3.1: CASH state with invested_flag=True is allowed to have weights (defensive replacement).
+    V4: Breadth overlay scales weights, so expected sum = final_exposure instead of 1.0.
 
     Args:
         rebalance_records: List of rebalance records to validate
@@ -124,7 +125,7 @@ def validate_weights_sum(
     Raises:
         ValidationError: If weights don't sum correctly
     """
-    # States where we should be invested (weights sum to 1 when stocks selected)
+    # States where we should be invested (weights sum to final_exposure when stocks selected)
     invested_states = {MarketState.RISK_ON, MarketState.DEFENSIVE_MOMENTUM}
 
     for record in rebalance_records:
@@ -137,10 +138,12 @@ def validate_weights_sum(
         if is_invested:
             # RISK_ON, DEFENSIVE_MOMENTUM, or CASH with defensive replacement
             if n_stocks > 0:
-                expected = 1.0
+                # V4: Expected weight sum = final_exposure (after breadth scaling)
+                # If breadth overlay is disabled, final_exposure = 1.0
+                expected = record.final_exposure
                 if abs(weight_sum - expected) > tolerance:
                     raise ValidationError(
-                        f"Weights sum to {weight_sum:.6f} (expected {expected}) "
+                        f"Weights sum to {weight_sum:.6f} (expected {expected:.6f}) "
                         f"at rebalance date {record.date.strftime('%Y-%m-%d')} in {record.state.name} state with {n_stocks} stocks"
                     )
             else:

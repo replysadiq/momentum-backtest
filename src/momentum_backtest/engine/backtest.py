@@ -35,6 +35,13 @@ from .state_machine import (
     compute_state_features,
     determine_initial_state,
 )
+from .breadth import (
+    BreadthConfig,
+    BreadthSeries,
+    compute_daily_breadth_series,
+    get_breadth_confidence,
+    scale_weights_by_breadth,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +61,12 @@ class RebalanceRecord:
     cash_entry_reason: Optional[str] = None
     # V3.1: True if actually invested (not holding cash) - for CASH state with defensive replacement
     invested_flag: bool = False
+    # V4: Breadth overlay values
+    breadth_raw: Optional[float] = None  # Raw fraction of stocks with positive 63d return
+    breadth_smooth: Optional[float] = None  # EMA-smoothed breadth
+    breadth_confidence: Optional[float] = None  # Confidence scalar in [0, 1]
+    base_exposure: float = 1.0  # Exposure before breadth overlay (1.0 if invested, 0.0 if cash)
+    final_exposure: float = 1.0  # Exposure after breadth overlay
 
 
 @dataclass
@@ -103,6 +116,9 @@ class BacktestResult:
 
     # V3.1: Time in CASH state but actually invested (defensive replacement)
     time_in_cash_invested: float = 0.0
+
+    # V4: Breadth overlay series
+    breadth_series: Optional[BreadthSeries] = None
 
 
 # =============================================================================
@@ -307,6 +323,22 @@ def run_backtest(
     bench_start_date = rebalance_calendar[0]
     bench_start_price = benchmark_prices[benchmark_prices.index >= bench_start_date].iloc[0]
     benchmark_curve = benchmark_prices / bench_start_price
+
+    # V4: Pre-compute daily breadth series (if enabled)
+    breadth_series: Optional[BreadthSeries] = None
+    if config.enable_breadth_overlay:
+        breadth_config = BreadthConfig(
+            lookback=config.breadth_lookback,
+            ema_span=config.breadth_ema_span,
+            low=config.breadth_low,
+            high=config.breadth_high,
+            min_coverage=config.breadth_min_coverage,
+        )
+        breadth_series = compute_daily_breadth_series(
+            price_data, trading_dates, breadth_config
+        )
+        logger.info(f"Breadth overlay enabled: lookback={config.breadth_lookback}, "
+                    f"ema_span={config.breadth_ema_span}, low={config.breadth_low}, high={config.breadth_high}")
 
     # Track portfolio equity between rebalances
     last_rebalance_date: Optional[pd.Timestamp] = None
@@ -580,7 +612,57 @@ def run_backtest(
                 not_in_price_data=0,
             ))
 
-        # Step 6: Record rebalance event
+        # Step 6a: V4 Breadth overlay - scale weights if enabled and invested
+        breadth_raw_val: Optional[float] = None
+        breadth_smooth_val: Optional[float] = None
+        breadth_conf_val: Optional[float] = None
+        base_exposure = 1.0 if invested_flag else 0.0
+        final_exposure = base_exposure
+
+        if config.enable_breadth_overlay and breadth_series is not None:
+            # Look up breadth values for this date
+            if rebalance_date in breadth_series.breadth_raw.index:
+                breadth_raw_val = breadth_series.breadth_raw.get(rebalance_date)
+                if pd.notna(breadth_raw_val):
+                    breadth_raw_val = float(breadth_raw_val)
+                else:
+                    breadth_raw_val = None
+            if rebalance_date in breadth_series.breadth_smooth.index:
+                breadth_smooth_val = float(breadth_series.breadth_smooth[rebalance_date])
+            breadth_conf_val = get_breadth_confidence(breadth_series, rebalance_date)
+
+            # Apply breadth scaling only to invested states
+            if invested_flag and new_weights:
+                # Scale weights by breadth confidence (remainder goes to cash)
+                scaled_weights = scale_weights_by_breadth(new_weights, breadth_conf_val)
+                final_exposure = base_exposure * breadth_conf_val
+
+                # Recompute turnover with scaled weights (vs previous scaled weights)
+                target_weights_series = pd.Series(scaled_weights) if scaled_weights else pd.Series(dtype=float)
+                turnover = compute_turnover(prev_weights_series, target_weights_series)
+
+                # Apply transaction costs for any change from scaling
+                if turnover > 0:
+                    additional_tc = apply_transaction_cost(0.0, turnover, config.tc_bps)
+                    transaction_cost = abs(additional_tc)
+                    equity = update_equity(equity, -abs(additional_tc))
+                    equity_curve[rebalance_date] = equity
+
+                # Track turnover by state
+                if current_state == MarketState.RISK_ON:
+                    turnover_risk_on += turnover
+                elif current_state in (MarketState.DEFENSIVE_MOMENTUM, MarketState.CASH):
+                    turnover_defensive += turnover
+
+                new_weights = scaled_weights
+                selected_tickers = list(new_weights.keys())
+
+                raw_str = f"{breadth_raw_val:.3f}" if breadth_raw_val is not None else "N/A"
+                smooth_str = f"{breadth_smooth_val:.3f}" if breadth_smooth_val is not None else "N/A"
+                logger.debug(f"  Breadth: raw={raw_str}, smooth={smooth_str}, "
+                            f"conf={breadth_conf_val:.3f}, exposure={final_exposure:.2%}")
+
+        # Step 6b: Record rebalance event
         # Capture cash_entry_reason from context (only set when entering CASH)
         cash_reason = state_context.cash_entry_reason
         state_context.cash_entry_reason = None  # Clear after capturing
@@ -595,6 +677,12 @@ def run_backtest(
             transaction_cost=abs(transaction_cost),
             cash_entry_reason=cash_reason,
             invested_flag=invested_flag,
+            # V4: Breadth values
+            breadth_raw=breadth_raw_val,
+            breadth_smooth=breadth_smooth_val,
+            breadth_confidence=breadth_conf_val,
+            base_exposure=base_exposure,
+            final_exposure=final_exposure,
         )
         rebalance_records.append(record)
 
@@ -655,6 +743,8 @@ def run_backtest(
         turnover_cash_panic=turnover_cash_panic,
         # V3.1: Time in CASH but invested
         time_in_cash_invested=cash_invested_count / n_rebalances if n_rebalances else 0,
+        # V4: Breadth series
+        breadth_series=breadth_series,
     )
 
     # Build log message with state distribution
