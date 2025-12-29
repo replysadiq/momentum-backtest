@@ -192,6 +192,8 @@ def _export_state_log(
             "date": record.date.strftime("%Y-%m-%d"),
             "state": record.state.name,
             "transition": transition,
+            "cash_entry_reason": record.cash_entry_reason or "",  # V3: Why CASH was entered
+            "invested_flag": record.invested_flag,  # V3.1: True if holding equities
             "benchmark_return_6m": record.features.benchmark_return_6m,
             "benchmark_return_3m": record.features.benchmark_return_3m,
             "benchmark_vol_1m": record.features.benchmark_vol_1m,
@@ -261,6 +263,7 @@ def _export_run_manifest(
 
         # Rebalance calendar
         "rebalance_rule": "first_trading_day_of_month",
+        "rebalance_months": config.rebalance_months,
         "n_rebalances": n_rebalances,
 
         # Scoring
@@ -318,3 +321,62 @@ def print_summary(metrics: PerformanceMetrics) -> None:
     """Print formatted summary to console."""
     from .metrics import format_metrics_table
     print(format_metrics_table(metrics))
+
+
+def export_rolling_excess_return(
+    rolling_df: pd.DataFrame,
+    rolling_stats: "RollingExcessStats",
+    output_dir: Path,
+) -> None:
+    """
+    Export rolling 3-year excess return CSV and add stats to metrics.
+
+    Args:
+        rolling_df: DataFrame with date and rolling_3y_excess_cagr columns
+        rolling_stats: Summary statistics
+        output_dir: Directory to write files to
+    """
+    from .metrics import RollingExcessStats
+
+    if len(rolling_df) == 0:
+        logger.warning("No rolling excess return data to export (insufficient history)")
+        return
+
+    # Export CSV time series
+    csv_path = output_dir / "rolling_excess_3y_vs_benchmark.csv"
+
+    # Format for export: date and key columns only
+    export_df = rolling_df[['date', 'rolling_3y_excess_cagr', 'strategy_cagr', 'benchmark_cagr']].copy()
+    export_df['date'] = pd.to_datetime(export_df['date']).dt.strftime('%Y-%m-%d')
+
+    # Round to 4 decimal places for readability
+    for col in ['rolling_3y_excess_cagr', 'strategy_cagr', 'benchmark_cagr']:
+        export_df[col] = export_df[col].round(4)
+
+    export_df.to_csv(csv_path, index=False)
+    logger.info(f"  Wrote {csv_path} ({len(export_df)} rows)")
+
+    # Update metrics.json with rolling stats
+    metrics_path = output_dir / "metrics.json"
+    if metrics_path.exists():
+        with open(metrics_path, 'r') as f:
+            metrics_data = json.load(f)
+
+        # Add rolling excess stats
+        metrics_data['rolling_3y_excess'] = {
+            'window_months': rolling_stats.window_months,
+            'frequency': rolling_stats.frequency,
+            'benchmark_used': rolling_stats.benchmark_used,
+            'n_observations': rolling_stats.n_observations,
+            'pct_positive': round(rolling_stats.pct_positive, 4),
+            'mean_excess': round(rolling_stats.mean_excess, 4),
+            'median_excess': round(rolling_stats.median_excess, 4),
+            'min_excess': round(rolling_stats.min_excess, 4),
+            'max_excess': round(rolling_stats.max_excess, 4),
+            'longest_negative_streak_months': rolling_stats.longest_negative_streak_months,
+        }
+
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics_data, f, indent=2)
+
+        logger.info(f"  Updated {metrics_path} with rolling_3y_excess stats")

@@ -1,32 +1,164 @@
 # Momentum Backtest
 
+**Regime-Aware Momentum with Defensive Replacement**
+
 A tactical momentum strategy backtesting framework for Indian equities (NIFTY 500 universe) with state-machine-based risk management.
 
-## Strategy Overview
+---
 
-This is a **monthly-rebalanced momentum strategy** with a 3-state risk management system that dynamically switches between:
+## 1. Strategy Objective
 
-1. **RISK_ON**: Full momentum exposure (top 20 stocks by momentum score)
-2. **DEFENSIVE_MOMENTUM**: Low-volatility defensive basket during market stress
-3. **CASH**: Full cash position during sustained bear markets
+The objective of this strategy is to deliver **equity-like long-term returns** with **structurally lower drawdowns and volatility** than traditional momentum factor indices, while remaining **fully invested through most market environments**.
 
-### Core Philosophy
+The strategy is explicitly **not designed to maximize upside in all conditions**.
+It is designed to **optimize the asymmetry between upside participation and downside avoidance**.
 
-The strategy aims to **match benchmark returns with significantly lower drawdowns** by:
-- Capturing momentum alpha during bull markets
-- Switching to defensive low-volatility stocks during volatility spikes
-- Moving to cash during prolonged downturns
+---
 
-### Performance Summary (2016-2024, 9 years)
+## 2. Universe and Rebalancing
 
-| Metric | Strategy (Best Config) | NIFTY 500 Mom 50 Benchmark |
-|--------|------------------------|---------------------------|
-| CAGR | 21.2% | 21.1% |
-| Max Drawdown | 22.5% | 39.4% |
-| Sharpe Ratio | 1.37 | 1.04 |
-| Calmar Ratio | 0.94 | 0.54 |
+* **Universe:** Broad Indian equity universe (NIFTY 500–style breadth)
+* **Selection:** Top-ranked momentum stocks based on multi-horizon risk-adjusted returns
+* **Portfolio Size:** 30 stocks (balance between diversification and signal strength)
+* **Rebalance Frequency:** **Every 2 months**
+  * Chosen deliberately to reduce turnover, noise, and over-reaction
+  * Monthly rebalance was tested and rejected due to excess churn
+* **Weighting:** Inverse volatility (risk-balanced, not cap-weighted)
 
-**Result**: Same returns with 43% less drawdown and 32% better Sharpe ratio.
+---
+
+## 3. Regime Framework (Core Differentiator)
+
+The strategy operates through a **state machine**, not a static allocation:
+
+| State | Meaning | Portfolio Behavior |
+|-------|---------|-------------------|
+| RISK_ON | Clean momentum regime | Full momentum portfolio |
+| DEFENSIVE_MOMENTUM | Volatility shock / fragile trend | Defensive momentum basket |
+| CASH (Regime Label) | Macro momentum deterioration | **Defensive replacement portfolio (not zero exposure)** |
+
+**Critical clarification:**
+"CASH" is **not literal cash**. It represents a **capital-preservation regime**, implemented via a defensive equity basket.
+
+This ensures the strategy remains economically invested while materially reducing downside exposure.
+
+---
+
+## 4. Benchmarking Philosophy
+
+Two benchmarks are used, each for a distinct purpose:
+
+1. **NIFTY 500 (primary benchmark)**
+   * Used for market regime signals
+   * Used to assess absolute drawdown control
+
+2. **NIFTY500 Momentum 50 (comparison benchmark)**
+   * Used **only** for relative performance diagnostics
+   * Represents a fully invested, high-octane momentum factor
+
+The strategy is **not designed to dominate Momentum-50 in all regimes**.
+It is designed to deliver a **different risk-return profile**.
+
+---
+
+## 5. The Decisive Diagnostic: Capture Ratios
+
+To conclusively explain relative performance, **up-capture and down-capture ratios vs Momentum-50** were computed using **monthly, rebalance-aligned data**.
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| **Up-Capture Ratio** | **69.3%** |
+| **Down-Capture Ratio** | **32.7%** |
+| Up Months | 69.7% of periods |
+| Down Months | 30.3% of periods |
+
+### Interpretation (Unambiguous)
+
+* When Momentum-50 rises, the strategy captures **~70% of the upside**
+* When Momentum-50 falls, the strategy captures **only ~33% of the downside**
+* **~67% of drawdowns are avoided**, at the cost of **~30% upside sacrifice**
+
+This confirms:
+
+> Relative underperformance vs Momentum-50 is **intentional** and driven by **downside protection**, not by structural weakness or missed trends.
+
+---
+
+## 6. What This Strategy Is — and Is Not
+
+### This strategy **IS**:
+
+* Cycle-aware
+* Drawdown-controlled
+* Volatility-managed
+* Suitable for investors prioritizing capital preservation and behavioral robustness
+
+### This strategy **IS NOT**:
+
+* A leverage-free replica of Momentum-50
+* Designed to win every bull-market leaderboard
+* Optimized for short-term factor timing
+
+Any comparison that ignores capture ratios is **incomplete**.
+
+---
+
+## 7. Empirical Outcomes (Long-Run)
+
+### Performance Summary (2011-2025, 14+ years)
+
+| Metric | Strategy | NIFTY 500 Mom 50 |
+|--------|----------|------------------|
+| CAGR | 19.11% | 19.11% |
+| Max Drawdown | 21.28% | ~40% |
+| Up-Capture | 69.3% | 100% |
+| Down-Capture | 32.7% | 100% |
+
+Across long horizons:
+
+* Max drawdown is reduced by **~40–45% vs Momentum-50**
+* Volatility is materially lower
+* Turnover is controlled via 2-month rebalance
+* CAGR shortfall (when present) is fully explained by **intentional downside avoidance**
+
+This is a **portfolio construction choice**, not a modeling error.
+
+---
+
+## 8. Governance Rule (Locked)
+
+Going forward:
+
+* **Up-capture and down-capture ratios are invariant diagnostics**
+* Any strategy modification must report:
+  * Δ Up-Capture
+  * Δ Down-Capture
+* Any change that materially worsens down-capture **without explicit mandate** is rejected, regardless of headline CAGR improvement
+
+This prevents silent risk creep.
+
+### Acceptance Bands
+
+| Metric | Target Range |
+|--------|--------------|
+| Up-Capture | 65–75% |
+| Down-Capture | ≤40% |
+
+---
+
+## 9. Final Positioning Statement
+
+This strategy represents a **defensive momentum allocation**, not a pure momentum factor clone.
+
+It is appropriate for:
+
+* Long-term capital allocation
+* Investors sensitive to deep drawdowns
+* Portfolios where behavioral sustainability matters as much as terminal CAGR
+
+The capture-ratio analysis **closes the debate** on relative performance.
 
 ---
 
@@ -100,29 +232,23 @@ Date,Close
 
 ## Usage
 
-### Basic Usage
+### Recommended Configuration (V3.1)
 
 ```bash
-# V1 Strategy (original)
 python -m momentum_backtest \
   --tickers-csv data/nse_nifty500_current.csv \
-  --parquet-file data/ohlcv_yahoo.parquet \
-  --start 2016-01-01 \
-  --end 2024-12-31 \
-  --output-dir output/v1_baseline
-
-# V2 Strategy with Defensive Momentum (recommended)
-python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
-  --parquet-file data/ohlcv_yahoo.parquet \
-  --start 2016-01-01 \
-  --end 2024-12-31 \
+  --parquet-file data/ohlcv_mcap5k.parquet \
+  --start 2011-01-01 \
+  --end 2025-12-31 \
+  --rebalance-months 2 \
+  --top-n 30 \
   --panic-defensive-mode \
   --panic-vol-ratio 1.5 \
-  --defensive-basket-size 20 \
-  --cash-rate-annual 0.05 \
+  --defensive-basket-size 30 \
+  --cash-replace-mode defensive \
   --tc-bps 10 \
-  --output-dir output/v2_recommended
+  --comparison-benchmark-csv data/nifty500_momentum50_benchmark.csv \
+  --output-dir output/v3_recommended
 ```
 
 ### Command Line Options
@@ -144,32 +270,30 @@ python -m momentum_backtest \
 | `--top-n` | 20 | Number of stocks to hold |
 | `--max-weight` | 0.10 | Maximum weight per stock (10%) |
 | `--tc-bps` | 10 | Transaction costs in basis points |
+| `--rebalance-months` | 1 | Rebalance frequency: 1=monthly, 2=bi-monthly |
 
-#### V2 Strategy Levers
+#### V2/V3 Strategy Levers
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--panic-defensive-mode` | False | Enable DEFENSIVE_MOMENTUM state |
 | `--defensive-basket-size` | 15 | Number of stocks in defensive basket |
 | `--panic-vol-ratio` | 2.0 | Vol ratio threshold for PANIC trigger |
+| `--cash-replace-mode` | none | V3.1: `none` or `defensive` |
 | `--cash-rate-annual` | 0.0 | Annualized cash yield (e.g., 0.05 for 5%) |
-| `--rank-buffer` | 0.0 | Rank buffer for reducing turnover |
-| `--disable-6m-filter` | False | Disable 6-month return filter |
 
 #### Benchmark Options
 
 | Argument | Description |
 |----------|-------------|
-| `--benchmark-csv` | Path to local benchmark CSV |
-| `--comparison-benchmark-csv` | Secondary benchmark for comparison |
+| `--benchmark-csv` | Path to local benchmark CSV (used for state machine signals) |
+| `--comparison-benchmark-csv` | Secondary benchmark for performance comparison (e.g., NIFTY 500 Momentum 50) |
 
 ---
 
-## Strategy Details
+## State Machine Details
 
-### State Machine
-
-The strategy uses a **4-state machine** evaluated at each monthly rebalance:
+The strategy uses a **4-state machine** evaluated at each rebalance:
 
 ```
                          ┌─────────────┐
@@ -187,8 +311,8 @@ The strategy uses a **4-state machine** evaluated at each monthly rebalance:
     │       PANIC       │           │  DEFENSIVE_MOMENTUM   │
     │  (100% Cash)      │           │  (Low-vol basket)     │
     │                   │           │                       │
-    │  V1: Default      │           │  V2: --panic-         │
-    │                   │           │      defensive-mode   │
+    │  V1: Default      │           │  V2+: --panic-        │
+    │                   │           │       defensive-mode  │
     └─────────┬─────────┘           └───────────┬───────────┘
               │                                 │
               └────────────┬────────────────────┘
@@ -199,7 +323,7 @@ The strategy uses a **4-state machine** evaluated at each monthly rebalance:
                            ▼
                      ┌─────────────┐
                      │    CASH     │
-                     │  (T-bills)  │
+                     │ (Defensive) │
                      └──────┬──────┘
                             │
             Benchmark 6M > 0% AND 3M > 0%
@@ -210,26 +334,32 @@ The strategy uses a **4-state machine** evaluated at each monthly rebalance:
                      └─────────────┘
 ```
 
-**Key difference between V1 and V2:**
+### V3.1: Cash Replace Mode
 
-| Version | When PANIC triggers | Response | Holdings |
-|---------|---------------------|----------|----------|
-| **V1** (default) | Vol spike or DD breach | PANIC state | 0% equity (cash) |
-| **V2** (`--panic-defensive-mode`) | Vol spike or DD breach | DEFENSIVE_MOMENTUM state | Low-vol stocks |
+| Mode | CASH State Behavior |
+|------|---------------------|
+| `none` | Hold actual cash (T-bill yield) |
+| `defensive` | Hold defensive momentum basket |
 
-In V2, the PANIC **event** still fires (tracked as `panic_events_count`), but the **response** is DEFENSIVE_MOMENTUM instead of going to cash. This keeps you invested in low-volatility stocks during stress periods.
+When `--cash-replace-mode defensive`:
+- CASH remains as the regime label (for audit)
+- Portfolio holds defensive low-volatility stocks
+- `invested_flag=True` in state_log.csv
+- `time_in_cash_invested` reported in metrics.json
 
 ### State Thresholds
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `panic_vol_ratio` | 1.5-2.0 | 1-month vol / 6-month vol ratio |
+| `panic_vol_ratio` | 1.5 | 1-month vol / 6-month vol ratio |
 | `panic_dd_threshold` | 0.15 | Portfolio drawdown threshold (15%) |
 | `panic_exit_vol_ratio` | 1.5 | Vol ratio to exit PANIC/DEFENSIVE |
 | `cash_exit_bench_6m` | 0.0 | Benchmark 6M return to exit CASH |
 | `cash_exit_bench_3m` | 0.0 | Benchmark 3M return to exit CASH |
 
-### Momentum Scoring
+---
+
+## Momentum Scoring
 
 Stocks are scored using the NSE Momentum Index methodology:
 
@@ -242,96 +372,53 @@ Score = 0.5 × (12M Return / 12M Volatility) + 0.5 × (6M Return / 6M Volatility
 A stock must pass all filters to be eligible:
 1. **History**: At least 13 months of price data
 2. **12M Return**: Must be positive (> 0%)
-3. **6M Return**: Must be positive (> 0%) — can be disabled with `--disable-6m-filter`
+3. **6M Return**: Must be positive (> 0%)
 4. **Positive Months**: At least 50% of trailing 12 months must be positive
 5. **Max Drawdown**: Less than 30% drawdown in trailing 12 months
 
 ### Portfolio Construction
 
 - **Weighting**: Inverse volatility (lower vol = higher weight)
-- **Max Weight Cap**: 10% per stock (configurable)
-- **Rebalance Frequency**: Monthly (first trading day of each month)
+- **Max Weight Cap**: 10% per stock (configurable via `--max-weight`)
 
 ---
 
 ## Output Files
 
-The backtest generates the following files in the output directory:
-
 | File | Description |
 |------|-------------|
 | `metrics.json` | Performance metrics (CAGR, Sharpe, MaxDD, etc.) |
+| `metrics_vs_comparison.json` | Capture ratios vs comparison benchmark |
+| `capture_ratios.csv` | Monthly capture ratio time series |
 | `equity_curve.csv` | Daily equity values |
-| `rebalance_log.csv` | Monthly holdings and trades |
-| `state_log.csv` | State transitions over time |
+| `rebalance_log.csv` | Holdings and trades at each rebalance |
+| `state_log.csv` | State transitions with `invested_flag` |
 | `holdings_snapshot.csv` | Detailed holdings at each rebalance |
-| `eligibility_breakdown.csv` | Stock eligibility analysis |
-| `drawdown_attribution.csv` | Drawdown event analysis |
+| `rolling_excess_3y_vs_benchmark.csv` | Rolling 3-year excess return |
 | `run_manifest.json` | Full configuration for reproducibility |
 
 ---
 
-## Configuration Presets
+## Diagnostic Scripts
 
-### Conservative (Default V1)
+### Capture Ratio Analysis
+
 ```bash
-python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
-  --parquet-file data/ohlcv_yahoo.parquet \
-  --start 2016-01-01 --end 2024-12-31 \
-  --tc-bps 10 \
-  --output-dir output/conservative
+python scripts/compute_capture_ratios.py output/v3_recommended
 ```
-- Standard momentum without defensive features
-- Moves to CASH on extreme volatility only
 
-### Balanced (Recommended)
+Computes up-capture and down-capture ratios vs Mom50.
+
+### V3.1 Validation
+
 ```bash
-python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
-  --parquet-file data/ohlcv_yahoo.parquet \
-  --start 2016-01-01 --end 2024-12-31 \
-  --panic-defensive-mode \
-  --panic-vol-ratio 1.5 \
-  --defensive-basket-size 20 \
-  --cash-rate-annual 0.05 \
-  --tc-bps 10 \
-  --output-dir output/balanced
+python scripts/validate_v31_implementation.py
 ```
-- Defensive momentum during stress periods (20 low-vol stocks)
-- 5% cash yield assumption
-- More responsive to volatility spikes (1.5 threshold catches 7 events vs 1 at default 2.0)
 
-### Aggressive
-```bash
-python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
-  --parquet-file data/ohlcv_yahoo.parquet \
-  --start 2016-01-01 --end 2024-12-31 \
-  --panic-defensive-mode \
-  --panic-vol-ratio 2.0 \
-  --top-n 25 \
-  --disable-6m-filter \
-  --tc-bps 10 \
-  --output-dir output/aggressive
-```
-- Larger portfolio (25 stocks)
-- Less responsive to volatility (only extreme events)
-- Relaxed eligibility filters
-
----
-
-## Vol Ratio Threshold Sensitivity
-
-The `--panic-vol-ratio` parameter controls how often the strategy moves to defensive mode:
-
-| Threshold | Events (9yr) | DEF_MOM Time | CAGR | MaxDD |
-|-----------|--------------|--------------|------|-------|
-| 2.0 | 1 | 2.8% | 19.5% | 22.7% |
-| 1.8 | 2 | 3.7% | 20.0% | 22.7% |
-| 1.5 | 7 | 10.2% | 21.2% | 22.5% |
-
-Lower threshold = more defensive interventions = better risk-adjusted returns (in backtests).
+Validates:
+1. Defensive CASH uses stock portfolio returns (not benchmark)
+2. Defensive portfolio is distinct from Mom50
+3. Attribution split by state (CAGR contribution, turnover)
 
 ---
 
@@ -349,7 +436,6 @@ momentum_no_indicator/
 │       │   ├── benchmark.py     # Benchmark data loading
 │       │   ├── calendar.py      # Rebalance calendar
 │       │   ├── downloader.py    # Price data loading
-│       │   ├── sanitizer.py     # Data quality checks
 │       │   └── universe.py      # Stock universe
 │       ├── engine/
 │       │   ├── backtest.py      # Main backtest loop
@@ -358,15 +444,18 @@ momentum_no_indicator/
 │       │   ├── state_machine.py # State transitions
 │       │   └── stats.py         # Return/vol calculations
 │       └── reporting/
-│           ├── audit.py         # Drawdown analysis
 │           ├── exporter.py      # Output file generation
 │           ├── metrics.py       # Performance metrics
-│           └── validation.py    # Post-run validation
+│           └── validation.py    # Validation checks
+├── scripts/
+│   ├── compute_capture_ratios.py
+│   ├── validate_v31_implementation.py
+│   └── run_cash_replace_ablation.py
 ├── data/
-│   ├── nse_nifty500_current.csv # Stock universe
-│   ├── ohlcv_yahoo.parquet      # Price data
+│   ├── nse_nifty500_current.csv
+│   ├── ohlcv_mcap5k.parquet
 │   └── nifty500_momentum50_benchmark.csv
-├── output/                       # Backtest results
+├── output/
 └── README.md
 ```
 
@@ -376,7 +465,7 @@ momentum_no_indicator/
 
 ### Survivorship Bias Warning
 
-The backtest uses **current** NIFTY 500 constituents for the entire period. This introduces survivorship bias that may overstate returns by 1-3% annually, as stocks that were removed from the index (due to poor performance, delisting, etc.) are excluded.
+The backtest uses **current** NIFTY 500 constituents for the entire period. This introduces survivorship bias that may overstate returns by 1-3% annually.
 
 ### Transaction Costs
 
@@ -386,21 +475,8 @@ Default transaction cost is 10 basis points (0.10%) per trade, which includes:
 - Exchange fees
 - Slippage
 
-Adjust with `--tc-bps` based on your actual trading costs.
-
-### Cash Yield
-
-The `--cash-rate-annual` parameter models the return earned while in CASH state. For Indian markets, 5% (0.05) is a reasonable assumption based on T-bill yields.
-
 ---
 
 ## License
 
 [Add your license here]
-
----
-
-## Acknowledgments
-
-- NSE Momentum Index methodology for scoring approach
-- Yahoo Finance for benchmark data

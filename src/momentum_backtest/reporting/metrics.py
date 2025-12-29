@@ -60,9 +60,12 @@ class PerformanceMetrics:
     trading_days: int
     years: float
 
-    # V2 Strategy versioning
+    # V2/V3 Strategy versioning
     strategy_version: str = "v1"
     enabled_levers: List[str] = field(default_factory=list)
+
+    # V3: Cash entry mode
+    cash_entry_mode: str = "baseline"
 
     # Panic event tracking (verify PANIC conditions are firing)
     panic_events_count: int = 0
@@ -74,6 +77,10 @@ class PerformanceMetrics:
     turnover_risk_on: float = 0.0
     turnover_defensive: float = 0.0
     turnover_cash_panic: float = 0.0
+
+    # V3.1: Cash replacement mode and invested time
+    cash_replace_mode: str = "none"
+    time_in_cash_invested: float = 0.0  # Fraction of CASH periods with defensive investment
 
 
 def compute_metrics(
@@ -97,6 +104,11 @@ def compute_metrics(
     turnover_risk_on: float = 0.0,
     turnover_defensive: float = 0.0,
     turnover_cash_panic: float = 0.0,
+    # V3: Cash entry mode
+    cash_entry_mode: str = "baseline",
+    # V3.1: Cash replacement mode
+    cash_replace_mode: str = "none",
+    time_in_cash_invested: float = 0.0,
 ) -> PerformanceMetrics:
     """
     Compute comprehensive performance metrics.
@@ -180,6 +192,7 @@ def compute_metrics(
         years=years,
         strategy_version=strategy_version,
         enabled_levers=enabled_levers,
+        cash_entry_mode=cash_entry_mode,
         # Panic event tracking
         panic_events_count=panic_events_count,
         panic_vol_ratio_triggers=panic_vol_ratio_triggers,
@@ -189,6 +202,9 @@ def compute_metrics(
         turnover_risk_on=turnover_risk_on,
         turnover_defensive=turnover_defensive,
         turnover_cash_panic=turnover_cash_panic,
+        # V3.1: Cash replacement
+        cash_replace_mode=cash_replace_mode,
+        time_in_cash_invested=time_in_cash_invested,
     )
 
     return metrics
@@ -237,18 +253,23 @@ def _compute_max_drawdown(equity: pd.Series) -> tuple[float, int]:
     max_dd = abs(drawdown.min())
 
     # Compute duration of max drawdown
-    peak_idx = running_max.idxmax()
     trough_idx = drawdown.idxmin()
 
-    # Find recovery point (next time equity equals peak)
+    # Find the peak before max drawdown: the date when equity first reached
+    # the running_max value at trough time
+    peak_value = running_max[trough_idx]
+    peak_candidates = equity[equity >= peak_value]
+    peak_idx = peak_candidates.index[0]  # First time equity reached this peak
+
+    # Find recovery point (next time equity equals peak after trough)
     recovery_candidates = equity[equity.index > trough_idx]
-    recovery_candidates = recovery_candidates[recovery_candidates >= running_max[trough_idx]]
+    recovery_candidates = recovery_candidates[recovery_candidates >= peak_value]
 
     if len(recovery_candidates) > 0:
         recovery_idx = recovery_candidates.index[0]
         duration = (recovery_idx - peak_idx).days
     else:
-        # Never recovered
+        # Never recovered - compute duration from peak to end of backtest
         duration = (equity.index[-1] - peak_idx).days
 
     return max_dd, duration
@@ -411,3 +432,154 @@ def format_metrics_table(metrics: PerformanceMetrics) -> str:
     ])
 
     return "\n".join(lines)
+
+
+@dataclass
+class RollingExcessStats:
+    """Summary statistics for rolling 3-year excess return."""
+    window_months: int
+    frequency: str
+    benchmark_used: str
+    n_observations: int
+    pct_positive: float
+    mean_excess: float
+    median_excess: float
+    min_excess: float
+    max_excess: float
+    longest_negative_streak_months: int
+
+
+def compute_rolling_excess_return(
+    equity_curve: pd.Series,
+    benchmark_curve: pd.Series,
+    rebalance_dates: pd.DatetimeIndex,
+    benchmark_name: str = "BENCHMARK",
+    window_months: int = 36,
+) -> tuple[pd.DataFrame, RollingExcessStats]:
+    """
+    Compute rolling N-year excess return (CAGR difference) vs benchmark.
+
+    This metric is DIAGNOSTIC ONLY - for narrative and analysis.
+    It should NOT be used for trading decisions or optimization.
+
+    Args:
+        equity_curve: Strategy equity curve (daily, normalized to start at 1.0)
+        benchmark_curve: Benchmark equity curve (daily, same dates as equity)
+        rebalance_dates: Dates to compute rolling metrics on (monthly)
+        benchmark_name: Name of benchmark for labeling
+        window_months: Rolling window in months (default: 36 = 3 years)
+
+    Returns:
+        Tuple of:
+        - DataFrame with columns: date, rolling_3y_excess_cagr
+        - RollingExcessStats with summary statistics
+    """
+    # Align benchmark to equity curve dates
+    benchmark_aligned = benchmark_curve.reindex(equity_curve.index)
+
+    # Calculate approximate trading days per month
+    days_per_month = 21  # ~252/12
+    window_days = window_months * days_per_month
+
+    results = []
+
+    for rebal_date in rebalance_dates:
+        # Find the window start (approximately N months back)
+        window_start_idx = equity_curve.index.get_indexer([rebal_date], method='ffill')[0]
+
+        if window_start_idx < window_days:
+            # Not enough history for full window
+            continue
+
+        # Get window bounds
+        end_idx = window_start_idx
+        start_idx = end_idx - window_days
+
+        # Extract windows
+        strat_window = equity_curve.iloc[start_idx:end_idx + 1]
+        bench_window = benchmark_aligned.iloc[start_idx:end_idx + 1]
+
+        # Skip if benchmark has missing data in window
+        if bench_window.isna().any() or len(bench_window) < window_days * 0.9:
+            continue
+
+        # Compute CAGR for both
+        strat_cagr = _compute_cagr(strat_window)
+        bench_cagr = _compute_cagr(bench_window)
+
+        # Excess return = Strategy CAGR - Benchmark CAGR
+        excess_cagr = strat_cagr - bench_cagr
+
+        results.append({
+            'date': rebal_date,
+            'rolling_3y_excess_cagr': excess_cagr,
+            'strategy_cagr': strat_cagr,
+            'benchmark_cagr': bench_cagr,
+        })
+
+    if not results:
+        # Return empty results if not enough data
+        empty_df = pd.DataFrame(columns=['date', 'rolling_3y_excess_cagr'])
+        empty_stats = RollingExcessStats(
+            window_months=window_months,
+            frequency="monthly",
+            benchmark_used=benchmark_name,
+            n_observations=0,
+            pct_positive=0.0,
+            mean_excess=0.0,
+            median_excess=0.0,
+            min_excess=0.0,
+            max_excess=0.0,
+            longest_negative_streak_months=0,
+        )
+        return empty_df, empty_stats
+
+    # Build DataFrame
+    df = pd.DataFrame(results)
+
+    # Compute summary statistics
+    excess_values = df['rolling_3y_excess_cagr']
+    n_obs = len(excess_values)
+    n_positive = (excess_values > 0).sum()
+
+    # Compute longest negative streak
+    longest_neg_streak = _compute_longest_negative_streak(excess_values)
+
+    stats = RollingExcessStats(
+        window_months=window_months,
+        frequency="monthly",
+        benchmark_used=benchmark_name,
+        n_observations=n_obs,
+        pct_positive=n_positive / n_obs if n_obs > 0 else 0.0,
+        mean_excess=float(excess_values.mean()),
+        median_excess=float(excess_values.median()),
+        min_excess=float(excess_values.min()),
+        max_excess=float(excess_values.max()),
+        longest_negative_streak_months=longest_neg_streak,
+    )
+
+    logger.info(
+        f"Rolling {window_months}M excess return: "
+        f"{n_obs} observations, {stats.pct_positive:.1%} positive, "
+        f"mean={stats.mean_excess:.2%}"
+    )
+
+    return df, stats
+
+
+def _compute_longest_negative_streak(series: pd.Series) -> int:
+    """Compute the longest consecutive streak of negative values."""
+    if len(series) == 0:
+        return 0
+
+    max_streak = 0
+    current_streak = 0
+
+    for value in series:
+        if value < 0:
+            current_streak += 1
+            max_streak = max(max_streak, current_streak)
+        else:
+            current_streak = 0
+
+    return max_streak

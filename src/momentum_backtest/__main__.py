@@ -12,8 +12,10 @@ Orchestrates the full backtest workflow:
 8. Compute metrics and export results
 """
 
+import datetime
 import logging
 from pathlib import Path
+import subprocess
 import sys
 from typing import Optional
 
@@ -25,8 +27,14 @@ from .data.downloader import download_price_data, align_to_calendar, load_price_
 from .data.calendar import build_rebalance_calendar, validate_rebalance_calendar
 from .data.sanitizer import sanitize_stock_data
 from .engine.backtest import run_backtest
-from .reporting.metrics import compute_metrics
-from .reporting.exporter import export_results, print_summary
+from .reporting.metrics import (
+    compute_metrics,
+    compute_rolling_excess_return,
+    _compute_cagr,
+    _compute_max_drawdown,
+    _compute_volatility,
+)
+from .reporting.exporter import export_results, print_summary, export_rolling_excess_return
 from .validation import run_all_validations, ValidationError
 
 
@@ -160,9 +168,10 @@ def main(argv: Optional[list] = None) -> int:
 
         # Step 4: Build rebalance calendar FROM BENCHMARK TRADING DATES ONLY
         # This is the FROZEN calendar - never modified based on stock data
-        logger.info("Step 4: Building rebalance calendar from benchmark trading dates...")
+        freq_label = {1: "monthly", 2: "bi-monthly", 3: "quarterly"}[config.rebalance_months]
+        logger.info(f"Step 4: Building rebalance calendar ({freq_label})...")
         rebalance_calendar = build_rebalance_calendar(
-            trading_dates, config.start_date, config.end_date
+            trading_dates, config.start_date, config.end_date, config.rebalance_months
         )
         logger.info(f"  Rebalance dates: {len(rebalance_calendar)}")
 
@@ -242,6 +251,11 @@ def main(argv: Optional[list] = None) -> int:
             turnover_risk_on=result.turnover_risk_on,
             turnover_defensive=result.turnover_defensive,
             turnover_cash_panic=result.turnover_cash_panic,
+            # V3: Cash entry mode
+            cash_entry_mode=config.cash_entry_mode.value,
+            # V3.1: Cash replacement mode
+            cash_replace_mode=config.cash_replace_mode.value,
+            time_in_cash_invested=result.time_in_cash_invested,
         )
 
         # Compute comparison benchmark metrics if provided
@@ -253,24 +267,41 @@ def main(argv: Optional[list] = None) -> int:
             if len(comp_data) > 0:
                 # Normalize to start at 1.0
                 comp_curve = comp_data / comp_data.iloc[0]
+                # Standalone comparison-benchmark stats for metrics_vs_comparison.json.
                 comparison_metrics = compute_metrics(
-                    equity_curve=result.equity_curve,
+                    equity_curve=comp_curve,
                     benchmark_curve=comp_curve,
-                    time_in_risk_on=result.time_in_risk_on,
-                    time_in_panic=result.time_in_panic,
-                    time_in_cash=result.time_in_cash,
-                    total_turnover=result.total_turnover,
-                    total_transaction_costs=result.total_transaction_costs,
-                    time_in_defensive_momentum=result.time_in_defensive_momentum,
+                    time_in_risk_on=0.0,
+                    time_in_panic=0.0,
+                    time_in_cash=0.0,
+                    total_turnover=0.0,
+                    total_transaction_costs=0.0,
+                    time_in_defensive_momentum=0.0,
                     strategy_version=config.strategy_version,
                     enabled_levers=config.enabled_levers,
                     panic_events_count=result.panic_events_count,
                     panic_vol_ratio_triggers=result.panic_vol_ratio_triggers,
                     panic_dd_triggers=result.panic_dd_triggers,
                     panic_response_mode=result.panic_response_mode,
-                    turnover_risk_on=result.turnover_risk_on,
-                    turnover_defensive=result.turnover_defensive,
-                    turnover_cash_panic=result.turnover_cash_panic,
+                    turnover_risk_on=0.0,
+                    turnover_defensive=0.0,
+                    turnover_cash_panic=0.0,
+                    cash_entry_mode=config.cash_entry_mode.value,
+                    cash_replace_mode=config.cash_replace_mode.value,
+                    time_in_cash_invested=0.0,
+                )
+                tol = 1e-4
+                comp_cagr = _compute_cagr(comp_curve)
+                comp_vol = _compute_volatility(comp_curve)
+                comp_max_dd, _ = _compute_max_drawdown(comp_curve)
+                assert abs(comparison_metrics.cagr - comp_cagr) <= tol, (
+                    "Comparison CAGR should be computed from comp_curve."
+                )
+                assert abs(comparison_metrics.volatility - comp_vol) <= tol, (
+                    "Comparison volatility should be computed from comp_curve."
+                )
+                assert abs(comparison_metrics.max_drawdown - comp_max_dd) <= tol, (
+                    "Comparison max drawdown should be computed from comp_curve."
                 )
 
         # Step 9: Export results (including audit reports)
@@ -291,9 +322,63 @@ def main(argv: Optional[list] = None) -> int:
             import json
             from dataclasses import asdict
             comp_metrics_path = config.output_dir / "metrics_vs_comparison.json"
+            git_commit = None
+            try:
+                repo_root = Path(__file__).resolve().parents[2]
+                git_commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_root,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+            except (OSError, subprocess.SubprocessError):
+                git_commit = None
+            generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            payload = asdict(comparison_metrics)
+            payload["metadata"] = {
+                "series_name": comparison_benchmark.ticker,
+                "meaning": "standalone_benchmark_stats",
+                "generated_at": generated_at,
+                "git_commit": git_commit,
+            }
             with open(comp_metrics_path, "w") as f:
-                json.dump(asdict(comparison_metrics), f, indent=2, default=str)
+                json.dump(payload, f, indent=2, default=str)
             logger.info(f"  Wrote {comp_metrics_path}")
+
+        # Step 9b: Compute and export rolling 3-year excess return
+        # Use comparison benchmark if provided, else primary benchmark
+        rolling_benchmark = None
+        rolling_benchmark_name = None
+
+        if comparison_benchmark is not None:
+            rolling_benchmark = comparison_benchmark.data
+            rolling_benchmark_name = comparison_benchmark.ticker
+        elif benchmark_result is not None:
+            rolling_benchmark = benchmark_result.data
+            rolling_benchmark_name = benchmark_result.ticker
+
+        if rolling_benchmark is not None:
+            logger.info("Step 9b: Computing rolling 3-year excess return...")
+            # Normalize benchmark to same scale as equity curve
+            bench_aligned = rolling_benchmark.reindex(result.equity_curve.index).dropna()
+            if len(bench_aligned) > 0:
+                bench_normalized = bench_aligned / bench_aligned.iloc[0]
+
+                rolling_df, rolling_stats = compute_rolling_excess_return(
+                    equity_curve=result.equity_curve,
+                    benchmark_curve=bench_normalized,
+                    rebalance_dates=rebalance_calendar,
+                    benchmark_name=rolling_benchmark_name,
+                    window_months=36,
+                )
+
+                export_rolling_excess_return(
+                    rolling_df=rolling_df,
+                    rolling_stats=rolling_stats,
+                    output_dir=config.output_dir,
+                )
+        else:
+            logger.warning("No benchmark available for rolling excess return calculation")
 
         # Print summary to console
         print()

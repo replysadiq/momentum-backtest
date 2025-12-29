@@ -7,8 +7,33 @@ Logging is intentionally NOT done here - it belongs in the CLI/main module.
 
 from dataclasses import dataclass, field
 from datetime import date
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional
+
+
+class CashEntryMode(Enum):
+    """
+    V3: Cash entry mode variants for controlling when strategy goes to CASH.
+
+    - baseline: Original behavior (benchmark_6m_return <= 0)
+    - strict_dual: Require BOTH 6M AND 3M returns <= 0
+    - strict_persist: Require baseline condition for 2 consecutive rebalances
+    """
+    BASELINE = "baseline"
+    STRICT_DUAL = "strict_dual"
+    STRICT_PERSIST = "strict_persist"
+
+
+class CashReplaceMode(Enum):
+    """
+    V3.1: Cash replacement mode - what to hold when in CASH state.
+
+    - none: Hold cash (original behavior)
+    - defensive: Hold defensive momentum portfolio instead of cash
+    """
+    NONE = "none"
+    DEFENSIVE = "defensive"
 
 
 def _default_start_date() -> date:
@@ -84,9 +109,25 @@ class BacktestConfig:
     # Lever D: Disable 6M Filter
     disable_6m_filter: bool = False  # Skip 6M return > 0 filter
 
+    # Rebalance frequency (1 = monthly, 2 = bi-monthly, 3 = quarterly)
+    rebalance_months: int = 1
+
+    # V3: Cash entry mode (baseline, strict_dual, strict_persist)
+    cash_entry_mode: CashEntryMode = CashEntryMode.BASELINE
+
+    # V3.1: Cash replacement mode (none, defensive)
+    cash_replace_mode: CashReplaceMode = CashReplaceMode.NONE
+
     @property
     def strategy_version(self) -> str:
         """Compute strategy version based on enabled levers."""
+        # V3.1: cash_replace_mode != none
+        if self.cash_replace_mode != CashReplaceMode.NONE:
+            return "v3.1"
+        # V3: cash_entry_mode != baseline
+        if self.cash_entry_mode != CashEntryMode.BASELINE:
+            return "v3"
+        # V2: any of the V2 levers enabled
         if any([
             self.panic_defensive_mode,
             self.rank_buffer > 0,
@@ -98,7 +139,7 @@ class BacktestConfig:
 
     @property
     def enabled_levers(self) -> List[str]:
-        """List of enabled V2 levers for logging."""
+        """List of enabled V2/V3 levers for logging."""
         levers = []
         if self.panic_defensive_mode:
             levers.append(f"A:defensive_momentum(n={self.defensive_basket_size})")
@@ -108,6 +149,12 @@ class BacktestConfig:
             levers.append(f"B:min_hold({self.min_hold_months}mo)")
         if self.disable_6m_filter:
             levers.append("D:disable_6m_filter")
+        # V3: cash entry mode
+        if self.cash_entry_mode != CashEntryMode.BASELINE:
+            levers.append(f"V3:cash_entry({self.cash_entry_mode.value})")
+        # V3.1: cash replace mode
+        if self.cash_replace_mode != CashReplaceMode.NONE:
+            levers.append(f"V3.1:cash_replace({self.cash_replace_mode.value})")
         return levers
 
     def __post_init__(self) -> None:
@@ -143,12 +190,16 @@ class BacktestConfig:
         if self.min_hold_months < 0 or self.min_hold_months > 12:
             raise ValueError(f"min_hold_months must be in [0, 12], got {self.min_hold_months}")
 
-        if self.defensive_basket_size < 5 or self.defensive_basket_size > 30:
-            raise ValueError(f"defensive_basket_size must be in [5, 30], got {self.defensive_basket_size}")
+        if self.defensive_basket_size < 5 or self.defensive_basket_size > 50:
+            raise ValueError(f"defensive_basket_size must be in [5, 50], got {self.defensive_basket_size}")
 
         # Validate rank_buffer and min_hold_months are mutually exclusive
         if self.rank_buffer > 0 and self.min_hold_months > 0:
             raise ValueError("rank_buffer and min_hold_months are mutually exclusive")
+
+        # Validate rebalance_months
+        if self.rebalance_months not in (1, 2, 3):
+            raise ValueError(f"rebalance_months must be 1, 2, or 3, got {self.rebalance_months}")
 
     @property
     def tc_fraction(self) -> float:

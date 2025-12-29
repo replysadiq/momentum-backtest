@@ -20,7 +20,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from ..config import BacktestConfig
+from ..config import BacktestConfig, CashReplaceMode
 from ..data.sanitizer import get_eligible_stocks
 from .signals import rank_stocks_by_momentum, EligibilityBreakdown, select_defensive_basket
 from .portfolio import build_portfolio, build_defensive_portfolio, HoldingInfo
@@ -29,6 +29,8 @@ from .state_machine import (
     MarketState,
     StateFeatures,
     StateThresholds,
+    StateContext,
+    CashEntryMode,
     next_state,
     compute_state_features,
     determine_initial_state,
@@ -48,6 +50,10 @@ class RebalanceRecord:
     weights: Dict[str, float]
     turnover: float
     transaction_cost: float
+    # V3: Reason for CASH entry (None if not entering CASH this rebalance)
+    cash_entry_reason: Optional[str] = None
+    # V3.1: True if actually invested (not holding cash) - for CASH state with defensive replacement
+    invested_flag: bool = False
 
 
 @dataclass
@@ -94,6 +100,9 @@ class BacktestResult:
     turnover_risk_on: float = 0.0
     turnover_defensive: float = 0.0
     turnover_cash_panic: float = 0.0  # Liquidation turnover
+
+    # V3.1: Time in CASH state but actually invested (defensive replacement)
+    time_in_cash_invested: float = 0.0
 
 
 # =============================================================================
@@ -245,17 +254,30 @@ def run_backtest(
         BacktestResult with equity curve, records, and statistics
     """
     logger.info(f"Starting backtest: {len(rebalance_calendar)} rebalance dates")
-    if config.strategy_version == "v2":
-        logger.info(f"Strategy v2 enabled with levers: {', '.join(config.enabled_levers)}")
+    if config.strategy_version in ("v2", "v3"):
+        logger.info(f"Strategy {config.strategy_version} enabled with levers: {', '.join(config.enabled_levers)}")
 
-    # Initialize state machine thresholds (including V2 Lever A)
+    # Map config cash_entry_mode to state machine enum
+    from ..config import CashEntryMode as ConfigCashEntryMode
+    cash_mode_map = {
+        ConfigCashEntryMode.BASELINE: CashEntryMode.BASELINE,
+        ConfigCashEntryMode.STRICT_DUAL: CashEntryMode.STRICT_DUAL,
+        ConfigCashEntryMode.STRICT_PERSIST: CashEntryMode.STRICT_PERSIST,
+    }
+    sm_cash_entry_mode = cash_mode_map[config.cash_entry_mode]
+
+    # Initialize state machine thresholds (including V2 Lever A, V3 cash entry mode)
     thresholds = StateThresholds(
         panic_dd_threshold=config.panic_dd_threshold,
         panic_vol_ratio=config.panic_vol_ratio,
         panic_exit_vol_ratio=config.panic_exit_vol_ratio,
         panic_exit_bench_ret=config.panic_exit_bench_ret,
         panic_defensive_mode=config.panic_defensive_mode,  # V2 Lever A
+        cash_entry_mode=sm_cash_entry_mode,  # V3
     )
+
+    # Initialize state context for strict_persist mode (V3)
+    state_context = StateContext()
 
     # Initialize tracking variables
     equity = 1.0  # Start with $1
@@ -344,20 +366,22 @@ def run_backtest(
         # Step 5: Determine state transition
         if current_state is None:
             # First rebalance - determine initial state
-            current_state = determine_initial_state(features, thresholds)
+            current_state = determine_initial_state(features, thresholds, state_context)
         else:
-            current_state = next_state(current_state, features, thresholds)
+            current_state = next_state(current_state, features, thresholds, state_context)
 
         # Step 6: Execute based on state
         new_weights: Dict[str, float] = {}
         selected_tickers: List[str] = []
         turnover = 0.0
         transaction_cost = 0.0
+        invested_flag = False  # V3.1: True if actually holding equities
 
         # Convert current_weights to Series for turnover calculation
         prev_weights_series = pd.Series(current_weights) if current_weights else pd.Series(dtype=float)
 
         if current_state == MarketState.RISK_ON:
+            invested_flag = True  # RISK_ON = invested
             # Get eligible stocks
             eligible = get_eligible_stocks(price_data, rebalance_date, trading_dates)
 
@@ -418,6 +442,7 @@ def run_backtest(
             equity_curve[rebalance_date] = equity
 
         elif current_state == MarketState.DEFENSIVE_MOMENTUM:
+            invested_flag = True  # DEFENSIVE_MOMENTUM = invested
             # V2 Lever A: Hold low-volatility stocks during panic instead of cash
             eligible = get_eligible_stocks(price_data, rebalance_date, trading_dates)
 
@@ -469,8 +494,57 @@ def run_backtest(
                 not_in_price_data=0,
             ))
 
+        elif current_state == MarketState.CASH and config.cash_replace_mode == CashReplaceMode.DEFENSIVE:
+            # V3.1: CASH state with defensive replacement - hold defensive portfolio
+            invested_flag = True
+
+            eligible = get_eligible_stocks(price_data, rebalance_date, trading_dates)
+
+            # Select defensive basket (same as DEFENSIVE_MOMENTUM state)
+            defensive_scores = select_defensive_basket(
+                price_data,
+                eligible,
+                rebalance_date,
+                basket_size=config.defensive_basket_size,
+            )
+
+            # Build defensive portfolio
+            allocation = build_defensive_portfolio(
+                defensive_scores,
+                max_weight=config.max_weight,
+            )
+
+            new_weights = allocation.weights
+            selected_tickers = allocation.tickers
+
+            # Compute turnover
+            target_weights_series = pd.Series(new_weights) if new_weights else pd.Series(dtype=float)
+            turnover = compute_turnover(prev_weights_series, target_weights_series)
+            turnover_defensive += turnover  # Track as defensive turnover
+
+            # Apply transaction costs
+            transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
+            equity = update_equity(equity, -abs(transaction_cost))
+            equity_curve[rebalance_date] = equity
+
+            # Record eligibility
+            eligibility_records.append(EligibilityRecord(
+                date=rebalance_date,
+                state=current_state,
+                universe_count=universe_count,
+                data_eligible_count=len(eligible),
+                filter_passed_count=len(defensive_scores),
+                selected_count=len(allocation.tickers),
+                insufficient_history=0,
+                negative_returns=0,
+                low_positive_months=0,
+                high_drawdown=0,
+                score_computation_failed=0,
+                not_in_price_data=0,
+            ))
+
         else:
-            # PANIC or CASH - liquidate to cash
+            # PANIC or CASH (with no replacement) - liquidate to cash
             # Target weights = empty (all cash)
             target_weights_series = pd.Series(dtype=float)
 
@@ -507,6 +581,10 @@ def run_backtest(
             ))
 
         # Step 6: Record rebalance event
+        # Capture cash_entry_reason from context (only set when entering CASH)
+        cash_reason = state_context.cash_entry_reason
+        state_context.cash_entry_reason = None  # Clear after capturing
+
         record = RebalanceRecord(
             date=rebalance_date,
             state=current_state,
@@ -515,6 +593,8 @@ def run_backtest(
             weights=new_weights.copy(),
             turnover=turnover,
             transaction_cost=abs(transaction_cost),
+            cash_entry_reason=cash_reason,
+            invested_flag=invested_flag,
         )
         rebalance_records.append(record)
 
@@ -546,6 +626,12 @@ def run_backtest(
 
     n_rebalances = len(rebalance_records)
 
+    # V3.1: Count CASH periods where invested_flag=True (defensive replacement)
+    cash_invested_count = sum(
+        1 for r in rebalance_records
+        if r.state == MarketState.CASH and r.invested_flag
+    )
+
     result = BacktestResult(
         equity_curve=daily_equity,
         benchmark_curve=benchmark_curve,
@@ -567,6 +653,8 @@ def run_backtest(
         turnover_risk_on=turnover_risk_on,
         turnover_defensive=turnover_defensive,
         turnover_cash_panic=turnover_cash_panic,
+        # V3.1: Time in CASH but invested
+        time_in_cash_invested=cash_invested_count / n_rebalances if n_rebalances else 0,
     )
 
     # Build log message with state distribution

@@ -24,34 +24,41 @@ def build_rebalance_calendar(
     trading_dates: pd.DatetimeIndex,
     start_date: date,
     end_date: date,
+    rebalance_months: int = 1,
 ) -> pd.DatetimeIndex:
     """
-    Build the monthly rebalance calendar.
+    Build the rebalance calendar with configurable frequency.
 
-    Rebalance day = first trading day of each month.
+    Rebalance day = first trading day of each selected month.
 
     Algorithm:
-    1. Generate all calendar month starts within [start_date, end_date]
-    2. For each month start:
-       - If the 1st is a trading day → use it
-       - Else → use the next available trading day
-    3. Freeze this calendar before backtesting
+    1. Find anchor date: first trading day of the month on/after start_date
+    2. From anchor, step N months at a time (where N = rebalance_months)
+    3. For each selected month, use the first trading day of that month
+    4. Continue until we exceed end_date
 
     Args:
         trading_dates: DatetimeIndex of valid trading days (from benchmark)
         start_date: Backtest start date
         end_date: Backtest end date
+        rebalance_months: Rebalance frequency (1=monthly, 2=bi-monthly, 3=quarterly)
 
     Returns:
-        DatetimeIndex of rebalance dates (first trading day of each month)
+        DatetimeIndex of rebalance dates
 
     Raises:
         ValueError: If no valid rebalance dates can be generated
 
+    Invariants:
+        - Exactly one rebalance per selected rebalance month
+        - No rebalance dates outside [start_date, end_date]
+        - Strictly increasing dates
+        - Rebalance months step exactly N months apart (no drift)
+
     Example:
-        If Jan 1 is a Sunday and Jan 2 is a holiday,
-        and Jan 3 is the first trading day,
-        then Jan 3 is the rebalance date for January.
+        If rebalance_months=2 and start_date is Jan 15, 2020:
+        - Anchor = first trading day of Jan 2020 (e.g., Jan 2)
+        - Rebalances: Jan 2020, Mar 2020, May 2020, Jul 2020, ...
     """
     # Convert to pandas Timestamps for comparison
     start_ts = pd.Timestamp(start_date)
@@ -64,44 +71,63 @@ def build_rebalance_calendar(
     if len(period_trading_dates) == 0:
         raise ValueError(f"No trading dates in period {start_date} to {end_date}")
 
-    # Generate all month starts in the period
-    # Start from the beginning of start_date's month
-    month_starts = pd.date_range(
-        start=start_ts.replace(day=1),
-        end=end_ts,
-        freq="MS",  # Month Start
-    )
+    # Step 1: Find anchor month (the month containing or after start_date)
+    anchor_month_start = start_ts.replace(day=1)
+
+    # Step 2: Find the first trading day of anchor month (this is our first rebalance)
+    anchor_candidates = period_trading_dates[period_trading_dates >= anchor_month_start]
+    if len(anchor_candidates) == 0:
+        raise ValueError(f"No trading days found on/after {start_date}")
+
+    first_trading_day = anchor_candidates[0]
+
+    # If first trading day is in a different month, use that month as anchor
+    if first_trading_day.month != anchor_month_start.month:
+        anchor_month_start = first_trading_day.replace(day=1)
 
     rebalance_dates: List[pd.Timestamp] = []
+    current_month = anchor_month_start
+    month_step = 0
 
-    for month_start in month_starts:
-        # Find the first trading day >= month_start
-        candidates = period_trading_dates[period_trading_dates >= month_start]
+    while current_month <= end_ts:
+        # Find the first trading day of current_month
+        month_candidates = period_trading_dates[
+            (period_trading_dates >= current_month) &
+            (period_trading_dates.month == current_month.month) &
+            (period_trading_dates.year == current_month.year)
+        ]
 
-        if len(candidates) == 0:
-            # No more trading days - we've reached the end
-            logger.debug(f"No trading day found for month starting {month_start.date()}")
-            continue
+        if len(month_candidates) > 0:
+            rebal_date = month_candidates[0]
+            # Only include if within [start_date, end_date]
+            if rebal_date >= start_ts and rebal_date <= end_ts:
+                rebalance_dates.append(rebal_date)
+                logger.debug(
+                    f"Month {current_month.strftime('%Y-%m')}: "
+                    f"rebalance on {rebal_date.date()}"
+                )
+        else:
+            logger.debug(
+                f"Month {current_month.strftime('%Y-%m')}: no trading days, skipping"
+            )
 
-        first_trading_day = candidates[0]
-
-        # Only include if it's still within the same month
-        # (handles edge case where month start is at end of period)
-        if first_trading_day.month == month_start.month:
-            rebalance_dates.append(first_trading_day)
-            logger.debug(f"Month {month_start.strftime('%Y-%m')}: rebalance on {first_trading_day.date()}")
-        elif first_trading_day <= end_ts:
-            # If month had no trading days, the first trading day of next month is used
-            # But we skip this to avoid double-counting
-            logger.debug(f"Month {month_start.strftime('%Y-%m')}: no trading days, skipping")
+        # Step to next rebalance month
+        month_step += rebalance_months
+        current_month = anchor_month_start + pd.DateOffset(months=month_step)
 
     if not rebalance_dates:
-        raise ValueError(f"No valid rebalance dates generated for period {start_date} to {end_date}")
+        raise ValueError(
+            f"No valid rebalance dates generated for period {start_date} to {end_date}"
+        )
 
     calendar = pd.DatetimeIndex(rebalance_dates).sort_values()
 
+    # Validate invariants
+    _validate_calendar_invariants(calendar, start_ts, end_ts, rebalance_months)
+
+    freq_label = {1: "monthly", 2: "bi-monthly", 3: "quarterly"}[rebalance_months]
     logger.info(
-        f"Rebalance calendar built: {len(calendar)} dates from "
+        f"Rebalance calendar built ({freq_label}): {len(calendar)} dates from "
         f"{calendar[0].date()} to {calendar[-1].date()}"
     )
 
@@ -109,6 +135,48 @@ def build_rebalance_calendar(
     logger.debug(f"First 5 rebalance dates: {[d.date() for d in calendar[:5]]}")
 
     return calendar
+
+
+def _validate_calendar_invariants(
+    calendar: pd.DatetimeIndex,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    rebalance_months: int,
+) -> None:
+    """
+    Validate calendar invariants.
+
+    Raises:
+        AssertionError: If any invariant is violated
+    """
+    # Invariant 1: No dates outside [start_date, end_date]
+    assert calendar[0] >= start_ts, (
+        f"First rebalance {calendar[0].date()} is before start_date {start_ts.date()}"
+    )
+    assert calendar[-1] <= end_ts, (
+        f"Last rebalance {calendar[-1].date()} is after end_date {end_ts.date()}"
+    )
+
+    # Invariant 2: Strictly increasing
+    for i in range(1, len(calendar)):
+        assert calendar[i] > calendar[i - 1], (
+            f"Calendar not strictly increasing: {calendar[i - 1].date()} >= {calendar[i].date()}"
+        )
+
+    # Invariant 3: Rebalance months step exactly N months apart
+    if len(calendar) >= 2:
+        for i in range(1, len(calendar)):
+            prev_date = calendar[i - 1]
+            curr_date = calendar[i]
+            # Calculate month difference
+            month_diff = (
+                (curr_date.year - prev_date.year) * 12 +
+                (curr_date.month - prev_date.month)
+            )
+            assert month_diff == rebalance_months, (
+                f"Month step between {prev_date.date()} and {curr_date.date()} "
+                f"is {month_diff}, expected {rebalance_months}"
+            )
 
 
 def get_lookback_dates(

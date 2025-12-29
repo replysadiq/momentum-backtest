@@ -113,7 +113,9 @@ def validate_weights_sum(
     tolerance: float = 1e-6,
 ) -> None:
     """
-    Assert that weights sum to 1 (RISK_ON/DEFENSIVE_MOMENTUM with stocks) or 0 (CASH/PANIC or no eligible stocks).
+    Assert that weights sum to 1 (invested) or 0 (not invested).
+
+    V3.1: CASH state with invested_flag=True is allowed to have weights (defensive replacement).
 
     Args:
         rebalance_records: List of rebalance records to validate
@@ -129,9 +131,11 @@ def validate_weights_sum(
         weight_sum = sum(record.weights.values())
         n_stocks = len(record.weights)
 
-        if record.state in invested_states:
-            # RISK_ON or DEFENSIVE_MOMENTUM with stocks: weights must sum to 1
-            # With no eligible stocks: weights = 0 (held in cash)
+        # V3.1: Check invested_flag - if True, this is an invested state regardless of state name
+        is_invested = record.state in invested_states or record.invested_flag
+
+        if is_invested:
+            # RISK_ON, DEFENSIVE_MOMENTUM, or CASH with defensive replacement
             if n_stocks > 0:
                 expected = 1.0
                 if abs(weight_sum - expected) > tolerance:
@@ -147,7 +151,7 @@ def validate_weights_sum(
                         f"at rebalance date {record.date.strftime('%Y-%m-%d')} in {record.state.name} state"
                     )
         else:
-            # PANIC or CASH - should have no weights (sum = 0)
+            # PANIC or CASH (without defensive replacement) - should have no weights (sum = 0)
             expected = 0.0
             if abs(weight_sum - expected) > tolerance:
                 raise ValidationError(

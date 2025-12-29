@@ -19,7 +19,15 @@ from .stats import (
 )
 from .signals import compute_momentum_score, apply_eligibility_filters
 from .portfolio import select_top_stocks, compute_inverse_vol_weights
-from .state_machine import MarketState, StateFeatures, next_state, compute_state_features
+from .state_machine import (
+    MarketState,
+    StateFeatures,
+    StateThresholds,
+    StateContext,
+    CashEntryMode,
+    next_state,
+    compute_state_features,
+)
 from .backtest import run_backtest, BacktestResult
 
 __all__ = [
@@ -35,6 +43,9 @@ __all__ = [
     "compute_inverse_vol_weights",
     "MarketState",
     "StateFeatures",
+    "StateThresholds",
+    "StateContext",
+    "CashEntryMode",
     "next_state",
     "compute_state_features",
     "run_backtest",

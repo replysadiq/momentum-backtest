@@ -11,7 +11,7 @@ import logging
 import sys
 from typing import Optional
 
-from .config import BacktestConfig
+from .config import BacktestConfig, CashEntryMode, CashReplaceMode
 
 
 logger = logging.getLogger(__name__)
@@ -233,6 +233,41 @@ Examples:
              "Keeps: 12M return > 0, >=60%% positive months",
     )
 
+    # Rebalance frequency
+    parser.add_argument(
+        "--rebalance-months",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="Rebalance frequency in months: 1=monthly (default), 2=bi-monthly, 3=quarterly",
+    )
+
+    # === V3 Strategy Levers ===
+    v3_group = parser.add_argument_group("V3 Strategy Levers")
+
+    v3_group.add_argument(
+        "--cash-entry-mode",
+        type=str,
+        choices=["baseline", "strict_dual", "strict_persist"],
+        default="baseline",
+        help="V3: Cash entry mode. "
+             "'baseline' = original (6M ret <= 0), "
+             "'strict_dual' = require 6M AND 3M ret <= 0, "
+             "'strict_persist' = require baseline condition for 2 consecutive rebalances. "
+             "(default: baseline)",
+    )
+
+    v3_group.add_argument(
+        "--cash-replace-mode",
+        type=str,
+        choices=["none", "defensive"],
+        default="none",
+        help="V3.1: Cash replacement mode. "
+             "'none' = hold cash when in CASH state (original), "
+             "'defensive' = hold defensive momentum portfolio instead of cash. "
+             "(default: none)",
+    )
+
     return parser.parse_args(args)
 
 
@@ -290,6 +325,11 @@ def build_config(args: argparse.Namespace) -> BacktestConfig:
         "rank_buffer": args.rank_buffer,
         "min_hold_months": args.min_hold_months,
         "disable_6m_filter": args.disable_6m_filter,
+        "rebalance_months": args.rebalance_months,
+        # V3 levers
+        "cash_entry_mode": CashEntryMode(args.cash_entry_mode),
+        # V3.1 levers
+        "cash_replace_mode": CashReplaceMode(args.cash_replace_mode),
     }
 
     # Add dates if specified
