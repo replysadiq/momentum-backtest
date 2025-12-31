@@ -60,8 +60,11 @@ class BacktestConfig:
     All optional parameters have sensible defaults matching the specification.
     """
 
-    # Required: path to CSV file with NIFTY 500 tickers
-    tickers_csv: Path
+    # Optional: path to CSV file with NIFTY 500 tickers
+    tickers_csv: Optional[Path]
+
+    # Price column to use for returns/volatility computations
+    price_column: str = "close"
 
     # Output directory for results
     output_dir: Path = field(default_factory=lambda: Path("output"))
@@ -70,9 +73,14 @@ class BacktestConfig:
     start_date: date = field(default_factory=_default_start_date)
     end_date: date = field(default_factory=_default_end_date)
 
+    # Lookback windows (months)
+    min_history_months: int = 13
+    momentum_lookback_months: int = 12
+    volatility_lookback_months: int = 6
+
     # Portfolio parameters
     top_n_stocks: int = 20
-    max_weight: Optional[float] = 0.10  # None to disable cap
+    max_weight: Optional[float] = 0.05  # None to disable cap
 
     # Drawdown filter (optional eligibility filter)
     use_dd_filter: bool = False
@@ -121,6 +129,9 @@ class BacktestConfig:
     @property
     def strategy_version(self) -> str:
         """Compute strategy version based on enabled levers."""
+        # V3.4: concentration cap (always on when configured)
+        if self.max_weight is not None:
+            return "v3.4"
         # V3.1: cash_replace_mode != none
         if self.cash_replace_mode != CashReplaceMode.NONE:
             return "v3.1"
@@ -155,17 +166,30 @@ class BacktestConfig:
         # V3.1: cash replace mode
         if self.cash_replace_mode != CashReplaceMode.NONE:
             levers.append(f"V3.1:cash_replace({self.cash_replace_mode.value})")
+        # V3.4: concentration cap
+        if self.max_weight is not None:
+            levers.append(f"V3.4:max_weight_cap({self.max_weight:.2f})")
         return levers
 
     def __post_init__(self) -> None:
         """Validate configuration parameters."""
-        # Validate tickers_csv exists
-        if not self.tickers_csv.exists():
+        # Validate tickers_csv exists if provided
+        if self.tickers_csv is not None and not self.tickers_csv.exists():
             raise FileNotFoundError(f"Tickers CSV file not found: {self.tickers_csv}")
 
         # Validate date range
         if self.start_date >= self.end_date:
             raise ValueError(f"start_date ({self.start_date}) must be before end_date ({self.end_date})")
+
+        if self.price_column not in ("close", "adj_close"):
+            raise ValueError("price_column must be 'close' or 'adj_close'")
+
+        if self.min_history_months < 1:
+            raise ValueError("min_history_months must be >= 1")
+        if self.momentum_lookback_months < 1:
+            raise ValueError("momentum_lookback_months must be >= 1")
+        if self.volatility_lookback_months < 1:
+            raise ValueError("volatility_lookback_months must be >= 1")
 
         # Validate numeric parameters
         if self.top_n_stocks < 1:

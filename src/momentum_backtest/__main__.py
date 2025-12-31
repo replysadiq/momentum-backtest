@@ -19,6 +19,8 @@ import subprocess
 import sys
 from typing import Optional
 
+import pandas as pd
+
 from .cli import parse_args, setup_logging, build_config
 from .data.staging import stage_parquet_file, stage_ticker_csv, StagingError
 from .data.universe import load_universe
@@ -131,10 +133,18 @@ def main(argv: Optional[list] = None) -> int:
         logger.info(f"Scoring method: {scoring_method}")
         logger.info("=" * 60)
 
+        # Require at least one data source for universe
+        if args.parquet_file is None and config.tickers_csv is None:
+            raise ValueError("Provide --parquet-file or --tickers-csv to define the universe")
+
         # Step 1: Stage external data files into project ./data folder
         logger.info("Step 1: Staging data files...")
-        staged_tickers_csv = stage_ticker_csv(config.tickers_csv, PROJECT_DATA_DIR)
-        logger.info(f"  Staged ticker CSV: {staged_tickers_csv}")
+        staged_tickers_csv = None
+        if config.tickers_csv is not None:
+            staged_tickers_csv = stage_ticker_csv(config.tickers_csv, PROJECT_DATA_DIR)
+            logger.info(f"  Staged ticker CSV: {staged_tickers_csv}")
+        else:
+            logger.info("  No ticker CSV provided; using parquet symbols for universe")
 
         staged_parquet = None
         if args.parquet_file is not None:
@@ -143,8 +153,12 @@ def main(argv: Optional[list] = None) -> int:
 
         # Step 2: Load ticker universe from staged file
         logger.info("Step 2: Loading ticker universe...")
-        tickers = load_universe(staged_tickers_csv)
-        logger.info(f"  Loaded {len(tickers)} tickers")
+        if staged_tickers_csv is None:
+            tickers = []
+            logger.info("  Skipping ticker CSV load (parquet-only run)")
+        else:
+            tickers = load_universe(staged_tickers_csv)
+            logger.info(f"  Loaded {len(tickers)} tickers")
 
         # Step 3: Get benchmark data and trading calendar
         logger.info("Step 3: Getting benchmark data...")
@@ -191,15 +205,32 @@ def main(argv: Optional[list] = None) -> int:
 
         # Step 5: Load or download stock data
         if staged_parquet is not None:
-            logger.info(f"Step 5: Loading stock price data from staged parquet...")
+            logger.info("Step 5: Loading stock price data from staged parquet...")
+            # When using parquet data, derive the active universe from available symbols
+            # to avoid warnings for post-listing/pre-delisting tickers.
+            parquet_symbols = pd.read_parquet(staged_parquet, columns=["symbol"])
+            parquet_symbols = parquet_symbols["symbol"].astype(str).str.strip()
+            parquet_symbols = parquet_symbols.str.replace(".NS", "", regex=False)
+            parquet_symbols = parquet_symbols.str.replace(".BO", "", regex=False)
+            tickers = sorted({f"{sym}.NS" for sym in parquet_symbols.unique() if sym})
+            logger.info(f"  Using {len(tickers)} tickers derived from parquet symbols")
             raw_price_data = load_price_data_from_parquet(
-                staged_parquet, tickers, config.start_date, config.end_date
+                staged_parquet,
+                tickers,
+                config.start_date,
+                config.end_date,
+                price_column=config.price_column,
+                warn_missing=False,
             )
             logger.info(f"  Loaded data for {len(raw_price_data)} stocks from parquet")
         else:
             logger.info("Step 5: Downloading stock price data...")
             raw_price_data = download_price_data(
-                tickers, config.start_date, config.end_date, show_progress=True
+                tickers,
+                config.start_date,
+                config.end_date,
+                price_column=config.price_column,
+                show_progress=True,
             )
             logger.info(f"  Downloaded data for {len(raw_price_data)} stocks")
 
@@ -256,10 +287,16 @@ def main(argv: Optional[list] = None) -> int:
             # V3.1: Cash replacement mode
             cash_replace_mode=config.cash_replace_mode.value,
             time_in_cash_invested=result.time_in_cash_invested,
+            pct_time_concentration_gated=result.pct_time_concentration_gated,
+            avg_invested_fraction_by_state=result.avg_invested_fraction_by_state,
+            avg_holdings_by_state=result.avg_holdings_by_state,
+            pct_time_true_cash=result.pct_time_true_cash,
         )
 
         # Compute comparison benchmark metrics if provided
         comparison_metrics = None
+        strategy_vs_comparison_metrics = None
+        comparison_benchmark_stats = None
         if comparison_benchmark is not None:
             logger.info("  Computing comparison benchmark metrics...")
             # Align comparison benchmark to equity curve dates
@@ -289,6 +326,10 @@ def main(argv: Optional[list] = None) -> int:
                     cash_entry_mode=config.cash_entry_mode.value,
                     cash_replace_mode=config.cash_replace_mode.value,
                     time_in_cash_invested=0.0,
+                    pct_time_concentration_gated=0.0,
+                    avg_invested_fraction_by_state={},
+                    avg_holdings_by_state={},
+                    pct_time_true_cash=0.0,
                 )
                 tol = 1e-4
                 comp_cagr = _compute_cagr(comp_curve)
@@ -302,6 +343,58 @@ def main(argv: Optional[list] = None) -> int:
                 )
                 assert abs(comparison_metrics.max_drawdown - comp_max_dd) <= tol, (
                     "Comparison max drawdown should be computed from comp_curve."
+                )
+                strategy_vs_comparison_metrics = compute_metrics(
+                    equity_curve=result.equity_curve,
+                    benchmark_curve=comp_curve,
+                    time_in_risk_on=result.time_in_risk_on,
+                    time_in_panic=result.time_in_panic,
+                    time_in_cash=result.time_in_cash,
+                    total_turnover=result.total_turnover,
+                    total_transaction_costs=result.total_transaction_costs,
+                    time_in_defensive_momentum=result.time_in_defensive_momentum,
+                    strategy_version=config.strategy_version,
+                    enabled_levers=config.enabled_levers,
+                    panic_events_count=result.panic_events_count,
+                    panic_vol_ratio_triggers=result.panic_vol_ratio_triggers,
+                    panic_dd_triggers=result.panic_dd_triggers,
+                    panic_response_mode=result.panic_response_mode,
+                    turnover_risk_on=result.turnover_risk_on,
+                    turnover_defensive=result.turnover_defensive,
+                    turnover_cash_panic=result.turnover_cash_panic,
+                    cash_entry_mode=config.cash_entry_mode.value,
+                    cash_replace_mode=config.cash_replace_mode.value,
+                    time_in_cash_invested=result.time_in_cash_invested,
+                    pct_time_concentration_gated=result.pct_time_concentration_gated,
+                    avg_invested_fraction_by_state=result.avg_invested_fraction_by_state,
+                    avg_holdings_by_state=result.avg_holdings_by_state,
+                    pct_time_true_cash=result.pct_time_true_cash,
+                )
+                comparison_benchmark_stats = compute_metrics(
+                    equity_curve=comp_curve,
+                    benchmark_curve=comp_curve,
+                    time_in_risk_on=0.0,
+                    time_in_panic=0.0,
+                    time_in_cash=0.0,
+                    total_turnover=0.0,
+                    total_transaction_costs=0.0,
+                    time_in_defensive_momentum=0.0,
+                    strategy_version=config.strategy_version,
+                    enabled_levers=config.enabled_levers,
+                    panic_events_count=result.panic_events_count,
+                    panic_vol_ratio_triggers=result.panic_vol_ratio_triggers,
+                    panic_dd_triggers=result.panic_dd_triggers,
+                    panic_response_mode=result.panic_response_mode,
+                    turnover_risk_on=0.0,
+                    turnover_defensive=0.0,
+                    turnover_cash_panic=0.0,
+                    cash_entry_mode=config.cash_entry_mode.value,
+                    cash_replace_mode=config.cash_replace_mode.value,
+                    time_in_cash_invested=0.0,
+                    pct_time_concentration_gated=0.0,
+                    avg_invested_fraction_by_state={},
+                    avg_holdings_by_state={},
+                    pct_time_true_cash=0.0,
                 )
 
         # Step 9: Export results (including audit reports)
@@ -345,6 +438,22 @@ def main(argv: Optional[list] = None) -> int:
                 json.dump(payload, f, indent=2, default=str)
             logger.info(f"  Wrote {comp_metrics_path}")
 
+        if strategy_vs_comparison_metrics is not None:
+            import json
+            from dataclasses import asdict
+            strategy_comp_path = config.output_dir / "metrics_strategy_vs_comparison.json"
+            with open(strategy_comp_path, "w") as f:
+                json.dump(asdict(strategy_vs_comparison_metrics), f, indent=2, default=str)
+            logger.info(f"  Wrote {strategy_comp_path}")
+
+        if comparison_benchmark_stats is not None:
+            import json
+            from dataclasses import asdict
+            comparison_stats_path = config.output_dir / "comparison_benchmark_stats.json"
+            with open(comparison_stats_path, "w") as f:
+                json.dump(asdict(comparison_benchmark_stats), f, indent=2, default=str)
+            logger.info(f"  Wrote {comparison_stats_path}")
+
         # Step 9b: Compute and export rolling 3-year excess return
         # Use comparison benchmark if provided, else primary benchmark
         rolling_benchmark = None
@@ -387,13 +496,45 @@ def main(argv: Optional[list] = None) -> int:
         # Print comparison summary if available
         if comparison_metrics is not None:
             print()
-            print(f"VS COMPARISON BENCHMARK ({comparison_benchmark.ticker})")
+            print(f"{comparison_benchmark.ticker.replace('_', ' ')}")
             print("-" * 30)
             print(f"  Comparison CAGR:   {comparison_metrics.benchmark_cagr*100:>7.2f}%")
             print(f"  Comparison Vol:    {comparison_metrics.benchmark_volatility*100:>7.2f}%")
             print(f"  Comparison MaxDD:  {comparison_metrics.benchmark_max_drawdown*100:>7.2f}%")
-            print(f"  Excess Return:     {comparison_metrics.excess_return*100:>7.2f}%")
-            print(f"  Info Ratio:        {comparison_metrics.information_ratio:>7.2f}")
+            print(f"  Comparison Sharpe: {comparison_metrics.sharpe_ratio:>7.2f}")
+            print(f"  Comparison Sortino:{comparison_metrics.sortino_ratio:>7.2f}")
+            print(f"  Comparison Calmar: {comparison_metrics.calmar_ratio:>7.2f}")
+
+            # Strategy-only rolling 3Y CAGR (console output only)
+            rolling_df, _ = compute_rolling_excess_return(
+                equity_curve=result.equity_curve,
+                benchmark_curve=result.equity_curve,
+                rebalance_dates=rebalance_calendar,
+                benchmark_name="STRATEGY",
+                window_months=36,
+            )
+            if rolling_df.empty:
+                print("  Rolling 3Y CAGR:   N/A (insufficient history)")
+            else:
+                strat_cagr = rolling_df["strategy_cagr"]
+                latest_rolling = strat_cagr.iloc[-1]
+                print(f"  Rolling 3Y CAGR:   {latest_rolling*100:>7.2f}%")
+                print(f"  Rolling 3Y Min:    {strat_cagr.min()*100:>7.2f}%")
+                print(f"  Rolling 3Y Median: {strat_cagr.median()*100:>7.2f}%")
+                print(f"  Rolling 3Y Max:    {strat_cagr.max()*100:>7.2f}%")
+
+                buckets = {
+                    "<0%": (strat_cagr < 0.0),
+                    "0-8%": (strat_cagr >= 0.0) & (strat_cagr <= 0.08),
+                    "9-12%": (strat_cagr > 0.08) & (strat_cagr <= 0.12),
+                    "13-20%": (strat_cagr > 0.12) & (strat_cagr <= 0.20),
+                    ">20%": (strat_cagr > 0.20),
+                }
+                total = len(strat_cagr)
+                for label, mask in buckets.items():
+                    count = int(mask.sum())
+                    pct = (count / total) * 100 if total else 0.0
+                    print(f"  Rolling 3Y {label:>5}: {count:>4} ({pct:>5.1f}%)")
 
         logger.info("Backtest completed successfully!")
         return 0

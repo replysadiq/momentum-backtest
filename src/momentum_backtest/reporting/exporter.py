@@ -14,6 +14,7 @@ Produces:
 
 from dataclasses import asdict
 from datetime import date
+import math
 import json
 from pathlib import Path
 from typing import List, Optional
@@ -194,6 +195,13 @@ def _export_state_log(
             "transition": transition,
             "cash_entry_reason": record.cash_entry_reason or "",  # V3: Why CASH was entered
             "invested_flag": record.invested_flag,  # V3.1: True if holding equities
+            "selected_count": record.selected_count,
+            "defensive_selected_count": record.defensive_selected_count,
+            "max_weight": record.max_weight,
+            "min_required": record.min_required,
+            "invested_fraction": record.invested_fraction,
+            "concentration_gate_triggered": record.concentration_gate_triggered,
+            "concentration_gate_reason": record.concentration_gate_reason,
             "benchmark_return_6m": record.features.benchmark_return_6m,
             "benchmark_return_3m": record.features.benchmark_return_3m,
             "benchmark_vol_1m": record.features.benchmark_vol_1m,
@@ -252,6 +260,10 @@ def _export_run_manifest(
     """
     from ..config import BacktestConfig
 
+    min_required = None
+    if config.max_weight is not None and config.max_weight > 0:
+        min_required = int(math.ceil(1.0 / config.max_weight))
+
     manifest = {
         # Date range
         "start_date": str(config.start_date),
@@ -281,6 +293,7 @@ def _export_run_manifest(
         # Portfolio construction
         "top_n": config.top_n_stocks,
         "max_weight": config.max_weight,
+        "min_required_holdings": min_required,
         "weighting": "inverse_volatility_6m",
 
         # Transaction costs

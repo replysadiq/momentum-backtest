@@ -12,7 +12,7 @@ Orchestrates the simulation loop:
 CRITICAL: All return computations use EXCLUSIVE end boundaries to prevent lookahead bias.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Dict, List, Optional
 import logging
@@ -54,6 +54,14 @@ class RebalanceRecord:
     cash_entry_reason: Optional[str] = None
     # V3.1: True if actually invested (not holding cash) - for CASH state with defensive replacement
     invested_flag: bool = False
+    # V3.4: Concentration cap diagnostics
+    selected_count: int = 0
+    defensive_selected_count: int = 0
+    max_weight: float = 0.0
+    min_required: int = 0
+    invested_fraction: float = 0.0
+    concentration_gate_triggered: bool = False
+    concentration_gate_reason: str = ""
 
 
 @dataclass
@@ -104,6 +112,12 @@ class BacktestResult:
     # V3.1: Time in CASH state but actually invested (defensive replacement)
     time_in_cash_invested: float = 0.0
 
+    # V3.4: Concentration diagnostics
+    pct_time_concentration_gated: float = 0.0
+    avg_invested_fraction_by_state: Dict[str, float] = field(default_factory=dict)
+    avg_holdings_by_state: Dict[str, float] = field(default_factory=dict)
+    pct_time_true_cash: float = 0.0
+
 
 # =============================================================================
 # Pure helper functions for testability (Fix 5)
@@ -116,6 +130,7 @@ def compute_segment_return(
     start_date: pd.Timestamp,
     end_date_exclusive: pd.Timestamp,
     trading_dates: pd.DatetimeIndex,
+    cash_rate_annual: float = 0.0,
 ) -> float:
     """
     Compute portfolio return for a holding segment with EXCLUSIVE end boundary.
@@ -134,6 +149,10 @@ def compute_segment_return(
         Gross portfolio return as decimal
     """
     if not weights:
+        # Cash return
+        if cash_rate_annual > 0:
+            days_in_period = (end_date_exclusive - start_date).days
+            return cash_rate_annual * (days_in_period / 365.0)
         return 0.0  # Cash return = 0
 
     # Get trading dates in [start, end) - EXCLUSIVE end
@@ -172,6 +191,12 @@ def compute_segment_return(
             # Missing data - assume flat (conservative)
             logger.debug(f"Missing price data for {ticker} in period")
 
+    invested_fraction = sum(weights.values())
+    if cash_rate_annual > 0 and invested_fraction < 1.0:
+        days_in_period = (end_date_exclusive - start_date).days
+        cash_return = cash_rate_annual * (days_in_period / 365.0)
+        portfolio_return += (1.0 - invested_fraction) * cash_return
+
     return portfolio_return
 
 
@@ -180,6 +205,7 @@ def compute_daily_return(
     weights: Dict[str, float],
     prev_date: pd.Timestamp,
     curr_date: pd.Timestamp,
+    daily_cash_yield: float = 0.0,
 ) -> float:
     """
     Compute one-day portfolio return.
@@ -194,7 +220,7 @@ def compute_daily_return(
         Daily return as decimal
     """
     if not weights:
-        return 0.0
+        return daily_cash_yield
 
     day_return = 0.0
     for ticker, weight in weights.items():
@@ -210,6 +236,10 @@ def compute_daily_return(
                 day_return += weight * stock_return
         except KeyError:
             continue
+
+    invested_fraction = sum(weights.values())
+    if invested_fraction < 1.0 and daily_cash_yield > 0:
+        day_return += (1.0 - invested_fraction) * daily_cash_yield
 
     return day_return
 
@@ -300,6 +330,12 @@ def run_backtest(
     turnover_defensive = 0.0
     turnover_cash_panic = 0.0
 
+    # V3.4: Concentration gate threshold
+    if config.max_weight is not None and config.max_weight > 0:
+        min_required = int(np.ceil(1.0 / config.max_weight))
+    else:
+        min_required = 1
+
     # Universe count for eligibility reporting
     universe_count = len(price_data.columns)
 
@@ -326,6 +362,7 @@ def run_backtest(
                     last_rebalance_date,
                     rebalance_date,  # EXCLUSIVE - last price is day BEFORE this
                     trading_dates,
+                    cash_rate_annual=config.cash_rate_annual,
                 )
             else:
                 # In cash: apply cash yield
@@ -376,6 +413,12 @@ def run_backtest(
         turnover = 0.0
         transaction_cost = 0.0
         invested_flag = False  # V3.1: True if actually holding equities
+        selected_count = 0
+        defensive_selected_count = 0
+        invested_fraction = 0.0
+        concentration_gate_triggered = False
+        concentration_gate_reason = ""
+        requested_state = current_state
 
         # Convert current_weights to Series for turnover calculation
         prev_weights_series = pd.Series(current_weights) if current_weights else pd.Series(dtype=float)
@@ -383,7 +426,14 @@ def run_backtest(
         if current_state == MarketState.RISK_ON:
             invested_flag = True  # RISK_ON = invested
             # Get eligible stocks
-            eligible = get_eligible_stocks(price_data, rebalance_date, trading_dates)
+            eligible = get_eligible_stocks(
+                price_data,
+                rebalance_date,
+                trading_dates,
+                min_history_months=config.min_history_months,
+                momentum_lookback_months=config.momentum_lookback_months,
+                volatility_lookback_months=config.volatility_lookback_months,
+            )
 
             # Rank by momentum (returns RankingResult with scores and eligibility)
             # V2 Lever D: Pass disable_6m_filter
@@ -411,11 +461,17 @@ def run_backtest(
                 min_hold_months=config.min_hold_months,  # V2 Lever B
             )
 
+            logger.info(
+                f"[{rebalance_date.date()}] Eligible={len(eligible)} "
+                f"Selected={len(allocation.tickers)} "
+                f"Top={allocation.tickers[:min(5, len(allocation.tickers))]}"
+            )
+
             # Record eligibility data
             elig = ranking_result.eligibility
             eligibility_records.append(EligibilityRecord(
                 date=rebalance_date,
-                state=current_state,
+                state=requested_state,
                 universe_count=elig.universe_count,
                 data_eligible_count=elig.data_eligible_count,
                 filter_passed_count=elig.filter_passed_count,
@@ -430,6 +486,16 @@ def run_backtest(
 
             new_weights = allocation.weights
             selected_tickers = allocation.tickers
+            selected_count = len(allocation.tickers)
+
+            if selected_count < min_required:
+                concentration_gate_triggered = True
+                concentration_gate_reason = "risk_on_insufficient_breadth"
+                invested_flag = False
+                current_state = MarketState.CASH
+                new_weights = {}
+                selected_tickers = []
+                current_holdings = {}
 
             # Compute turnover using canonical function (Fix 2)
             target_weights_series = pd.Series(new_weights) if new_weights else pd.Series(dtype=float)
@@ -437,14 +503,22 @@ def run_backtest(
             turnover_risk_on += turnover  # Track RISK_ON turnover
 
             # Apply transaction costs
-            transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
-            equity = update_equity(equity, -abs(transaction_cost))
-            equity_curve[rebalance_date] = equity
+            if turnover > 0:
+                transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
+                equity = update_equity(equity, -abs(transaction_cost))
+                equity_curve[rebalance_date] = equity
 
         elif current_state == MarketState.DEFENSIVE_MOMENTUM:
             invested_flag = True  # DEFENSIVE_MOMENTUM = invested
             # V2 Lever A: Hold low-volatility stocks during panic instead of cash
-            eligible = get_eligible_stocks(price_data, rebalance_date, trading_dates)
+            eligible = get_eligible_stocks(
+                price_data,
+                rebalance_date,
+                trading_dates,
+                min_history_months=config.min_history_months,
+                momentum_lookback_months=config.momentum_lookback_months,
+                volatility_lookback_months=config.volatility_lookback_months,
+            )
 
             # Select defensive basket (lowest volatility stocks with positive momentum)
             defensive_scores = select_defensive_basket(
@@ -467,6 +541,14 @@ def run_backtest(
 
             new_weights = allocation.weights
             selected_tickers = allocation.tickers
+            defensive_selected_count = len(allocation.tickers)
+
+            if defensive_selected_count < min_required:
+                concentration_gate_triggered = True
+                concentration_gate_reason = "defensive_insufficient_breadth"
+                invested_flag = False
+                new_weights = {}
+                selected_tickers = []
 
             # Compute turnover
             target_weights_series = pd.Series(new_weights) if new_weights else pd.Series(dtype=float)
@@ -474,9 +556,10 @@ def run_backtest(
             turnover_defensive += turnover  # Track DEFENSIVE_MOMENTUM turnover
 
             # Apply transaction costs
-            transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
-            equity = update_equity(equity, -abs(transaction_cost))
-            equity_curve[rebalance_date] = equity
+            if turnover > 0:
+                transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
+                equity = update_equity(equity, -abs(transaction_cost))
+                equity_curve[rebalance_date] = equity
 
             # Record eligibility (defensive basket selection)
             eligibility_records.append(EligibilityRecord(
@@ -498,7 +581,14 @@ def run_backtest(
             # V3.1: CASH state with defensive replacement - hold defensive portfolio
             invested_flag = True
 
-            eligible = get_eligible_stocks(price_data, rebalance_date, trading_dates)
+            eligible = get_eligible_stocks(
+                price_data,
+                rebalance_date,
+                trading_dates,
+                min_history_months=config.min_history_months,
+                momentum_lookback_months=config.momentum_lookback_months,
+                volatility_lookback_months=config.volatility_lookback_months,
+            )
 
             # Select defensive basket (same as DEFENSIVE_MOMENTUM state)
             defensive_scores = select_defensive_basket(
@@ -516,6 +606,14 @@ def run_backtest(
 
             new_weights = allocation.weights
             selected_tickers = allocation.tickers
+            defensive_selected_count = len(allocation.tickers)
+
+            if defensive_selected_count < min_required:
+                concentration_gate_triggered = True
+                concentration_gate_reason = "defensive_insufficient_breadth"
+                invested_flag = False
+                new_weights = {}
+                selected_tickers = []
 
             # Compute turnover
             target_weights_series = pd.Series(new_weights) if new_weights else pd.Series(dtype=float)
@@ -523,9 +621,10 @@ def run_backtest(
             turnover_defensive += turnover  # Track as defensive turnover
 
             # Apply transaction costs
-            transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
-            equity = update_equity(equity, -abs(transaction_cost))
-            equity_curve[rebalance_date] = equity
+            if turnover > 0:
+                transaction_cost = apply_transaction_cost(0.0, turnover, config.tc_bps)
+                equity = update_equity(equity, -abs(transaction_cost))
+                equity_curve[rebalance_date] = equity
 
             # Record eligibility
             eligibility_records.append(EligibilityRecord(
@@ -567,7 +666,7 @@ def run_backtest(
             # Record eligibility (no stock selection in PANIC/CASH)
             eligibility_records.append(EligibilityRecord(
                 date=rebalance_date,
-                state=current_state,
+                state=requested_state,
                 universe_count=universe_count,
                 data_eligible_count=0,
                 filter_passed_count=0,
@@ -579,6 +678,16 @@ def run_backtest(
                 score_computation_failed=0,
                 not_in_price_data=0,
             ))
+
+        invested_fraction = sum(new_weights.values()) if new_weights else 0.0
+        cap_epsilon = 1e-9
+        if (
+            invested_fraction < 1.0 - cap_epsilon
+            and not concentration_gate_triggered
+            and invested_fraction > cap_epsilon
+        ):
+            concentration_gate_triggered = True
+            concentration_gate_reason = "cap_left_cash"
 
         # Step 6: Record rebalance event
         # Capture cash_entry_reason from context (only set when entering CASH)
@@ -595,6 +704,13 @@ def run_backtest(
             transaction_cost=abs(transaction_cost),
             cash_entry_reason=cash_reason,
             invested_flag=invested_flag,
+            selected_count=selected_count,
+            defensive_selected_count=defensive_selected_count,
+            max_weight=float(config.max_weight) if config.max_weight is not None else 0.0,
+            min_required=min_required,
+            invested_fraction=invested_fraction,
+            concentration_gate_triggered=concentration_gate_triggered,
+            concentration_gate_reason=concentration_gate_reason,
         )
         rebalance_records.append(record)
 
@@ -632,6 +748,24 @@ def run_backtest(
         if r.state == MarketState.CASH and r.invested_flag
     )
 
+    concentration_gate_count = sum(1 for r in rebalance_records if r.concentration_gate_triggered)
+    true_cash_count = sum(1 for r in rebalance_records if r.invested_fraction <= 1e-12)
+
+    avg_invested_fraction_by_state: Dict[str, float] = {}
+    avg_holdings_by_state: Dict[str, float] = {}
+    for state in MarketState:
+        state_records = [r for r in rebalance_records if r.state == state]
+        if state_records:
+            avg_invested_fraction_by_state[state.name] = float(
+                np.mean([r.invested_fraction for r in state_records])
+            )
+            avg_holdings_by_state[state.name] = float(
+                np.mean([len(r.weights) for r in state_records])
+            )
+        else:
+            avg_invested_fraction_by_state[state.name] = 0.0
+            avg_holdings_by_state[state.name] = 0.0
+
     result = BacktestResult(
         equity_curve=daily_equity,
         benchmark_curve=benchmark_curve,
@@ -655,6 +789,11 @@ def run_backtest(
         turnover_cash_panic=turnover_cash_panic,
         # V3.1: Time in CASH but invested
         time_in_cash_invested=cash_invested_count / n_rebalances if n_rebalances else 0,
+        # V3.4: Concentration diagnostics
+        pct_time_concentration_gated=concentration_gate_count / n_rebalances if n_rebalances else 0.0,
+        avg_invested_fraction_by_state=avg_invested_fraction_by_state,
+        avg_holdings_by_state=avg_holdings_by_state,
+        pct_time_true_cash=true_cash_count / n_rebalances if n_rebalances else 0.0,
     )
 
     # Build log message with state distribution
@@ -736,7 +875,11 @@ def _build_daily_equity(
 
             # Use pure function for daily return (Fix 5)
             day_return = compute_daily_return(
-                price_data, current_weights, prev_date, current_date
+                price_data,
+                current_weights,
+                prev_date,
+                current_date,
+                daily_cash_yield=daily_cash_yield,
             )
             daily_equity[current_date] = update_equity(prev_equity, day_return)
 

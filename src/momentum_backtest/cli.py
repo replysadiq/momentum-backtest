@@ -60,8 +60,9 @@ Examples:
     parser.add_argument(
         "--tickers-csv",
         type=Path,
-        required=True,
-        help="Path to CSV file with NIFTY 500 ticker list",
+        default=None,
+        help="Path to CSV file with NIFTY 500 ticker list. "
+             "Optional when --parquet-file is provided.",
     )
 
     # Data source
@@ -72,13 +73,21 @@ Examples:
         help="Path to parquet file with pre-downloaded OHLCV data. "
              "If provided, skips Yahoo Finance download.",
     )
+    parser.add_argument(
+        "--price-column",
+        type=str,
+        choices=["close", "adj_close"],
+        default="close",
+        help="Price column to use for returns/volatility calculations. "
+             "Choices: close, adj_close (default: close).",
+    )
 
     # Benchmark source
     parser.add_argument(
         "--benchmark-csv",
         type=Path,
         default=None,
-        help="Path to CSV file with primary benchmark index data (Date,Close columns). "
+        help="Path to CSV or parquet file with primary benchmark index data (Date,Close columns). "
              "Used for trading calendar and state machine signals. "
              "If not provided, downloads from Yahoo Finance.",
     )
@@ -113,6 +122,26 @@ Examples:
         help="End date (YYYY-MM-DD). Default: end of last year",
     )
 
+    # Lookback windows
+    parser.add_argument(
+        "--min-history-months",
+        type=int,
+        default=13,
+        help="Minimum history required before rebalance (months). Default: 13",
+    )
+    parser.add_argument(
+        "--momentum-lookback-months",
+        type=int,
+        default=12,
+        help="Momentum lookback window (months). Default: 12",
+    )
+    parser.add_argument(
+        "--volatility-lookback-months",
+        type=int,
+        default=6,
+        help="Volatility lookback window (months). Default: 6",
+    )
+
     # Portfolio parameters
     parser.add_argument(
         "--top-n",
@@ -123,8 +152,8 @@ Examples:
     parser.add_argument(
         "--max-weight",
         type=float,
-        default=0.10,
-        help="Maximum weight per stock (default: 0.10). Set to 0 to disable cap.",
+        default=0.05,
+        help="Maximum weight per stock (default: 0.05). Must be in (0, 1].",
     )
 
     # Drawdown filter
@@ -302,15 +331,13 @@ def build_config(args: argparse.Namespace) -> BacktestConfig:
     Returns:
         BacktestConfig instance
     """
-    # Handle max_weight = 0 meaning disabled
-    max_weight = args.max_weight if args.max_weight > 0 else None
-
     # Build config with defaults filled in
     config_kwargs = {
         "tickers_csv": args.tickers_csv,
+        "price_column": args.price_column,
         "output_dir": args.output_dir,
         "top_n_stocks": args.top_n,
-        "max_weight": max_weight,
+        "max_weight": args.max_weight,
         "use_dd_filter": args.use_dd_filter,
         "dd_threshold": args.dd_threshold,
         "nse_style_scoring": args.nse_style,
@@ -319,6 +346,9 @@ def build_config(args: argparse.Namespace) -> BacktestConfig:
         "panic_dd_threshold": args.panic_dd,
         "panic_vol_ratio": args.panic_vol_ratio,
         "verbose": args.verbose or args.debug,
+        "min_history_months": args.min_history_months,
+        "momentum_lookback_months": args.momentum_lookback_months,
+        "volatility_lookback_months": args.volatility_lookback_months,
         # V2 levers
         "panic_defensive_mode": args.panic_defensive_mode,
         "defensive_basket_size": args.defensive_basket_size,

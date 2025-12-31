@@ -113,9 +113,10 @@ def validate_weights_sum(
     tolerance: float = 1e-6,
 ) -> None:
     """
-    Assert that weights sum to 1 (invested) or 0 (not invested).
+    Assert that weights sum to <= 1 (invested) or 0 (not invested).
 
     V3.1: CASH state with invested_flag=True is allowed to have weights (defensive replacement).
+    V3.4: Weight caps may leave residual cash (sum < 1).
 
     Args:
         rebalance_records: List of rebalance records to validate
@@ -137,11 +138,15 @@ def validate_weights_sum(
         if is_invested:
             # RISK_ON, DEFENSIVE_MOMENTUM, or CASH with defensive replacement
             if n_stocks > 0:
-                expected = 1.0
-                if abs(weight_sum - expected) > tolerance:
+                if weight_sum > 1.0 + tolerance:
                     raise ValidationError(
-                        f"Weights sum to {weight_sum:.6f} (expected {expected}) "
+                        f"Weights sum to {weight_sum:.6f} (expected <= 1.0) "
                         f"at rebalance date {record.date.strftime('%Y-%m-%d')} in {record.state.name} state with {n_stocks} stocks"
+                    )
+                if weight_sum <= tolerance:
+                    raise ValidationError(
+                        f"Weights sum to {weight_sum:.6f} but {n_stocks} stocks selected "
+                        f"at rebalance date {record.date.strftime('%Y-%m-%d')} in {record.state.name} state"
                     )
             else:
                 # No eligible stocks - effectively in cash, weights should be 0
@@ -160,6 +165,63 @@ def validate_weights_sum(
                 )
 
     logger.debug(f"Validated weight sums for {len(rebalance_records)} rebalance records")
+
+
+def validate_concentration_caps(
+    rebalance_records: List[RebalanceRecord],
+    tolerance: float = 1e-8,
+) -> None:
+    """
+    Assert max-weight caps and concentration gates are honored.
+
+    Args:
+        rebalance_records: List of rebalance records
+        tolerance: Allowed numerical tolerance for cap checks
+
+    Raises:
+        ValidationError: If a cap or gate invariant is violated
+    """
+    for record in rebalance_records:
+        if record.weights and record.max_weight > 0:
+            max_weight_seen = max(record.weights.values())
+            if max_weight_seen > record.max_weight + tolerance:
+                raise ValidationError(
+                    f"Weight cap violated: max weight {max_weight_seen:.6f} "
+                    f"> cap {record.max_weight:.6f} at {record.date.strftime('%Y-%m-%d')}"
+                )
+
+        if record.selected_count > 0 and record.selected_count < record.min_required:
+            if record.concentration_gate_reason != "risk_on_insufficient_breadth":
+                raise ValidationError(
+                    f"Missing risk-on concentration gate at {record.date.strftime('%Y-%m-%d')} "
+                    f"(selected {record.selected_count} < min_required {record.min_required})"
+                )
+
+        if record.defensive_selected_count < record.min_required and record.defensive_selected_count > 0:
+            if record.concentration_gate_reason != "defensive_insufficient_breadth":
+                raise ValidationError(
+                    f"Missing defensive concentration gate at {record.date.strftime('%Y-%m-%d')} "
+                    f"(selected {record.defensive_selected_count} < min_required {record.min_required})"
+                )
+
+        if record.concentration_gate_reason == "risk_on_insufficient_breadth":
+            if record.invested_fraction > tolerance:
+                raise ValidationError(
+                    f"Risk-on concentration gate should be true cash at {record.date.strftime('%Y-%m-%d')}, "
+                    f"found invested_fraction={record.invested_fraction:.6f}"
+                )
+        if record.concentration_gate_reason == "defensive_insufficient_breadth":
+            if record.invested_fraction > tolerance:
+                raise ValidationError(
+                    f"Defensive concentration gate should be true cash at {record.date.strftime('%Y-%m-%d')}, "
+                    f"found invested_fraction={record.invested_fraction:.6f}"
+                )
+        if record.concentration_gate_reason == "cap_left_cash":
+            if record.invested_fraction >= 1.0 - tolerance:
+                raise ValidationError(
+                    f"Cap-left-cash gate expected invested_fraction < 1.0 at {record.date.strftime('%Y-%m-%d')}, "
+                    f"found {record.invested_fraction:.6f}"
+                )
 
 
 def validate_no_lookahead(
@@ -315,6 +377,7 @@ def run_all_validations(
     validate_rebalance_dates_are_trading_days(rebalance_calendar, trading_dates)
     validate_no_nans_in_features(rebalance_records)
     validate_weights_sum(rebalance_records)
+    validate_concentration_caps(rebalance_records)
     validate_no_nans_in_equity_curve(equity_curve)
     validate_state_transitions(rebalance_records)
     validate_price_data_coverage(price_data)

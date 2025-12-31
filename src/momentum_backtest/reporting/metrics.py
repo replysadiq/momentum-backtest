@@ -82,6 +82,12 @@ class PerformanceMetrics:
     cash_replace_mode: str = "none"
     time_in_cash_invested: float = 0.0  # Fraction of CASH periods with defensive investment
 
+    # V3.4: Concentration diagnostics
+    pct_time_concentration_gated: float = 0.0
+    avg_invested_fraction_by_state: dict = field(default_factory=dict)
+    avg_holdings_by_state: dict = field(default_factory=dict)
+    pct_time_true_cash: float = 0.0
+
 
 def compute_metrics(
     equity_curve: pd.Series,
@@ -109,6 +115,10 @@ def compute_metrics(
     # V3.1: Cash replacement mode
     cash_replace_mode: str = "none",
     time_in_cash_invested: float = 0.0,
+    pct_time_concentration_gated: float = 0.0,
+    avg_invested_fraction_by_state: Optional[dict] = None,
+    avg_holdings_by_state: Optional[dict] = None,
+    pct_time_true_cash: float = 0.0,
 ) -> PerformanceMetrics:
     """
     Compute comprehensive performance metrics.
@@ -131,6 +141,10 @@ def compute_metrics(
     """
     if enabled_levers is None:
         enabled_levers = []
+    if avg_invested_fraction_by_state is None:
+        avg_invested_fraction_by_state = {}
+    if avg_holdings_by_state is None:
+        avg_holdings_by_state = {}
     # Align equity curves to common dates
     common_dates = equity_curve.index.intersection(benchmark_curve.index)
     equity = equity_curve.reindex(common_dates)
@@ -205,6 +219,10 @@ def compute_metrics(
         # V3.1: Cash replacement
         cash_replace_mode=cash_replace_mode,
         time_in_cash_invested=time_in_cash_invested,
+        pct_time_concentration_gated=pct_time_concentration_gated,
+        avg_invested_fraction_by_state=avg_invested_fraction_by_state,
+        avg_holdings_by_state=avg_holdings_by_state,
+        pct_time_true_cash=pct_time_true_cash,
     )
 
     return metrics
@@ -558,7 +576,7 @@ def compute_rolling_excess_return(
         longest_negative_streak_months=longest_neg_streak,
     )
 
-    logger.info(
+    logger.debug(
         f"Rolling {window_months}M excess return: "
         f"{n_obs} observations, {stats.pct_positive:.1%} positive, "
         f"mean={stats.mean_excess:.2%}"

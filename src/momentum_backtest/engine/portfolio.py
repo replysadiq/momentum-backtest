@@ -196,7 +196,7 @@ def select_top_stocks_with_buffer(
 
 def compute_inverse_vol_weights(
     selected_stocks: List[MomentumScore],
-    max_weight: Optional[float] = 0.10,
+    max_weight: Optional[float] = 0.05,
 ) -> Dict[str, float]:
     """
     Compute inverse-volatility weights for selected stocks.
@@ -208,7 +208,7 @@ def compute_inverse_vol_weights(
         max_weight: Maximum weight per stock (None to disable cap)
 
     Returns:
-        Dictionary mapping ticker to weight (sums to 1.0)
+        Dictionary mapping ticker to weight (may sum to < 1.0 if capped)
     """
     if not selected_stocks:
         return {}
@@ -222,19 +222,18 @@ def compute_inverse_vol_weights(
     if not inverse_vols:
         # Fallback to equal weight if all vols are zero
         equal_weight = 1.0 / len(selected_stocks)
-        return {s.ticker: equal_weight for s in selected_stocks}
+        weights = {s.ticker: equal_weight for s in selected_stocks}
+        if max_weight is not None:
+            weights = _apply_weight_cap(weights, max_weight)
+        return weights
 
     # Normalize to sum to 1
     total_inv_vol = sum(inverse_vols.values())
     weights = {ticker: iv / total_inv_vol for ticker, iv in inverse_vols.items()}
 
-    # Apply weight cap if specified
+    # Apply weight cap if specified (leave remainder as cash)
     if max_weight is not None:
         weights = _apply_weight_cap(weights, max_weight)
-
-    # Verify weights sum to 1
-    total_weight = sum(weights.values())
-    assert abs(total_weight - 1.0) < 1e-9, f"Weights sum to {total_weight}, expected 1.0"
 
     return weights
 
@@ -244,55 +243,19 @@ def _apply_weight_cap(
     max_weight: float,
 ) -> Dict[str, float]:
     """
-    Apply maximum weight cap and redistribute excess.
-
-    Uses iterative redistribution until no weight exceeds cap.
+    Apply maximum weight cap without redistribution.
 
     Args:
         weights: Initial weights (should sum to 1)
         max_weight: Maximum allowed weight
 
     Returns:
-        Capped weights (sums to 1.0)
+        Capped weights (may sum to < 1.0)
     """
     if max_weight >= 1.0:
         return weights
 
-    capped = weights.copy()
-
-    # Iterative capping (may need multiple passes)
-    for _ in range(100):  # Safety limit
-        excess = 0.0
-        uncapped_total = 0.0
-        uncapped_tickers = []
-
-        for ticker, weight in capped.items():
-            if weight > max_weight:
-                excess += weight - max_weight
-                capped[ticker] = max_weight
-            else:
-                uncapped_total += weight
-                uncapped_tickers.append(ticker)
-
-        if excess < 1e-10:
-            break
-
-        # Redistribute excess proportionally to uncapped stocks
-        if uncapped_tickers and uncapped_total > 0:
-            for ticker in uncapped_tickers:
-                redistribution = excess * (capped[ticker] / uncapped_total)
-                capped[ticker] += redistribution
-        else:
-            # All stocks capped - this shouldn't happen with reasonable max_weight
-            logger.warning("All stocks at weight cap, cannot redistribute")
-            break
-
-    # Final normalization to ensure sum is exactly 1
-    total = sum(capped.values())
-    if total > 0:
-        capped = {t: w / total for t, w in capped.items()}
-
-    return capped
+    return {ticker: min(weight, max_weight) for ticker, weight in weights.items()}
 
 
 def compute_turnover(
@@ -326,7 +289,7 @@ def compute_turnover(
 def build_portfolio(
     ranked_scores: List[MomentumScore],
     top_n: int = 20,
-    max_weight: Optional[float] = 0.10,
+    max_weight: Optional[float] = 0.05,
     previous_weights: Optional[Dict[str, float]] = None,
     rebalance_date: Optional[pd.Timestamp] = None,
     # V2 Lever B parameters
@@ -401,9 +364,16 @@ def build_portfolio(
         turnover=turnover,
     )
 
+    if weights:
+        max_w = max(weights.values())
+        invested_frac = sum(weights.values())
+    else:
+        max_w = 0.0
+        invested_frac = 0.0
+
     logger.debug(
         f"Portfolio built: {len(allocation.tickers)} stocks, "
-        f"max_weight={max(weights.values()):.2%}, turnover={turnover:.2%}"
+        f"max_weight={max_w:.2%}, invested={invested_frac:.2%}, turnover={turnover:.2%}"
     )
 
     return allocation, updated_holdings
@@ -416,7 +386,7 @@ def build_portfolio(
 
 def build_defensive_portfolio(
     defensive_scores: List["DefensiveScore"],
-    max_weight: Optional[float] = 0.10,
+    max_weight: Optional[float] = 0.05,
     previous_weights: Optional[Dict[str, float]] = None,
     rebalance_date: Optional[pd.Timestamp] = None,
 ) -> PortfolioAllocation:

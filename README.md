@@ -251,6 +251,28 @@ python -m momentum_backtest \
   --output-dir output/v3_recommended
 ```
 
+### Price Column Examples
+
+```bash
+# Legacy (close)
+python -m momentum_backtest \
+  --tickers-csv data/nse_nifty500_current.csv \
+  --parquet-file data/ohlcv_yahoo.parquet \
+  --price-column close \
+  --start 2016-01-01 \
+  --end 2024-12-31 \
+  --output-dir output/legacy_close
+
+# vNext (adj_close)
+python -m momentum_backtest \
+  --tickers-csv data/nse_nifty500_current.csv \
+  --parquet-file data/ohlcv_yahoo.parquet \
+  --price-column adj_close \
+  --start 2016-01-01 \
+  --end 2024-12-31 \
+  --output-dir output/vnext_adj_close
+```
+
 ### Command Line Options
 
 #### Required Arguments
@@ -259,6 +281,7 @@ python -m momentum_backtest \
 |----------|-------------|
 | `--tickers-csv` | Path to CSV file with stock universe |
 | `--parquet-file` | Path to Parquet file with OHLCV data |
+| `--price-column` | Price column to use: `close` or `adj_close` |
 | `--start` | Backtest start date (YYYY-MM-DD) |
 | `--end` | Backtest end date (YYYY-MM-DD) |
 | `--output-dir` | Directory for output files |
@@ -268,7 +291,7 @@ python -m momentum_backtest \
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--top-n` | 20 | Number of stocks to hold |
-| `--max-weight` | 0.10 | Maximum weight per stock (10%) |
+| `--max-weight` | 0.05 | Maximum weight per stock (5%) |
 | `--tc-bps` | 10 | Transaction costs in basis points |
 | `--rebalance-months` | 1 | Rebalance frequency: 1=monthly, 2=bi-monthly |
 
@@ -379,7 +402,7 @@ A stock must pass all filters to be eligible:
 ### Portfolio Construction
 
 - **Weighting**: Inverse volatility (lower vol = higher weight)
-- **Max Weight Cap**: 10% per stock (configurable via `--max-weight`)
+- **Max Weight Cap**: 5% per stock (configurable via `--max-weight`)
 
 ---
 
