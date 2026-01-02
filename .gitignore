@@ -40,6 +40,10 @@ env/
 data/*.parquet
 data/*.csv
 !data/.gitkeep
+input_dataset/*.parquet
+input_dataset/*.parquet.bak_*
+new_data/*.parquet
+new_data/*.parquet.bak_*
 
 # Output files (generated)
 output/

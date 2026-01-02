@@ -1,10 +1,10 @@
 """
-Universe management for NIFTY 500 tickers.
+Universe management for ticker lists.
 
 Handles loading, normalization, and validation of the stock universe.
 
 SURVIVORSHIP BIAS NOTE:
-This system uses the CURRENT NIFTY 500 constituent list for the entire backtest period.
+This system uses the current constituent list for the entire backtest period.
 This introduces survivorship bias - stocks that were in the index historically but have
 since been removed (due to poor performance, delisting, or other reasons) are excluded.
 This typically overstates backtest performance by 1-3% annually.
@@ -91,7 +91,7 @@ def validate_tickers(tickers: List[str]) -> List[str]:
 
 def load_universe(csv_path: Path) -> List[str]:
     """
-    Load and validate the NIFTY 500 ticker universe from a CSV file.
+    Load and validate the ticker universe from a CSV file.
 
     The CSV file should have a column containing ticker symbols.
     The function will look for columns named 'Symbol', 'Ticker', or use the first column.
@@ -143,7 +143,7 @@ def load_universe(csv_path: Path) -> List[str]:
 
     # Log survivorship bias warning
     logger.warning(
-        "SURVIVORSHIP BIAS: Using current NIFTY 500 constituents for entire backtest period. "
+        "SURVIVORSHIP BIAS: Using current constituents for entire backtest period. "
         "This may overstate returns by 1-3% annually as removed stocks are excluded."
     )
 

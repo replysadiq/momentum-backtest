@@ -2,7 +2,7 @@
 Data layer for the momentum backtest system.
 
 Modules:
-- universe: NIFTY 500 ticker list management
+- universe: ticker list management
 - downloader: Yahoo Finance data acquisition
 - benchmark: Benchmark index selection with fallback
 - calendar: Rebalance calendar construction (single source of truth)

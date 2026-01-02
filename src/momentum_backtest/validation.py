@@ -87,7 +87,19 @@ def validate_no_nans_in_features(
     Raises:
         ValidationError: If any feature contains NaN
     """
+    tolerance = 1e-8
+
     for record in rebalance_records:
+        if record.state == MarketState.CASH_TRUE and record.invested_fraction > tolerance:
+            raise ValidationError(
+                f"CASH_TRUE must have zero invested_fraction at {record.date.strftime('%Y-%m-%d')}, "
+                f"found {record.invested_fraction:.6f}"
+            )
+        if record.state == MarketState.CASH_INVESTED and record.invested_fraction <= tolerance:
+            raise ValidationError(
+                f"CASH_INVESTED must have invested_fraction > 0 at {record.date.strftime('%Y-%m-%d')}, "
+                f"found {record.invested_fraction:.6f}"
+            )
         features = record.features
 
         # Check all feature values
@@ -117,6 +129,7 @@ def validate_weights_sum(
 
     V3.1: CASH state with invested_flag=True is allowed to have weights (defensive replacement).
     V3.4: Weight caps may leave residual cash (sum < 1).
+    V3.5: CASH states split into CASH_INVESTED and CASH_TRUE.
 
     Args:
         rebalance_records: List of rebalance records to validate
@@ -126,13 +139,13 @@ def validate_weights_sum(
         ValidationError: If weights don't sum correctly
     """
     # States where we should be invested (weights sum to 1 when stocks selected)
-    invested_states = {MarketState.RISK_ON, MarketState.DEFENSIVE_MOMENTUM}
+    invested_states = {MarketState.RISK_ON, MarketState.DEFENSIVE_MOMENTUM, MarketState.CASH_INVESTED}
 
     for record in rebalance_records:
         weight_sum = sum(record.weights.values())
         n_stocks = len(record.weights)
 
-        # V3.1: Check invested_flag - if True, this is an invested state regardless of state name
+        # V3.1/V3.5: Check invested_flag - if True, this is an invested state regardless of state name
         is_invested = record.state in invested_states or record.invested_flag
 
         if is_invested:
@@ -156,7 +169,7 @@ def validate_weights_sum(
                         f"at rebalance date {record.date.strftime('%Y-%m-%d')} in {record.state.name} state"
                     )
         else:
-            # PANIC or CASH (without defensive replacement) - should have no weights (sum = 0)
+            # PANIC or CASH_TRUE (no replacement) - should have no weights (sum = 0)
             expected = 0.0
             if abs(weight_sum - expected) > tolerance:
                 raise ValidationError(
@@ -191,26 +204,26 @@ def validate_concentration_caps(
                 )
 
         if record.selected_count > 0 and record.selected_count < record.min_required:
-            if record.concentration_gate_reason != "risk_on_insufficient_breadth":
+            if record.concentration_gate_reason != "risk_on_insufficient_concentration":
                 raise ValidationError(
                     f"Missing risk-on concentration gate at {record.date.strftime('%Y-%m-%d')} "
                     f"(selected {record.selected_count} < min_required {record.min_required})"
                 )
 
         if record.defensive_selected_count < record.min_required and record.defensive_selected_count > 0:
-            if record.concentration_gate_reason != "defensive_insufficient_breadth":
+            if record.concentration_gate_reason != "defensive_insufficient_concentration":
                 raise ValidationError(
                     f"Missing defensive concentration gate at {record.date.strftime('%Y-%m-%d')} "
                     f"(selected {record.defensive_selected_count} < min_required {record.min_required})"
                 )
 
-        if record.concentration_gate_reason == "risk_on_insufficient_breadth":
+        if record.concentration_gate_reason == "risk_on_insufficient_concentration":
             if record.invested_fraction > tolerance:
                 raise ValidationError(
                     f"Risk-on concentration gate should be true cash at {record.date.strftime('%Y-%m-%d')}, "
                     f"found invested_fraction={record.invested_fraction:.6f}"
                 )
-        if record.concentration_gate_reason == "defensive_insufficient_breadth":
+        if record.concentration_gate_reason == "defensive_insufficient_concentration":
             if record.invested_fraction > tolerance:
                 raise ValidationError(
                     f"Defensive concentration gate should be true cash at {record.date.strftime('%Y-%m-%d')}, "
@@ -293,10 +306,11 @@ def validate_state_transitions(
     Validate that state transitions follow the allowed rules.
 
     Allowed transitions:
-    - RISK_ON -> RISK_ON, PANIC, DEFENSIVE_MOMENTUM, CASH
-    - PANIC -> PANIC, CASH
-    - DEFENSIVE_MOMENTUM -> DEFENSIVE_MOMENTUM, CASH (V2 Lever A)
-    - CASH -> CASH, RISK_ON
+    - RISK_ON -> RISK_ON, PANIC, DEFENSIVE_MOMENTUM, CASH_INVESTED, CASH_TRUE
+    - PANIC -> PANIC, CASH_INVESTED, CASH_TRUE
+    - DEFENSIVE_MOMENTUM -> DEFENSIVE_MOMENTUM, CASH_INVESTED, CASH_TRUE (V2 Lever A)
+    - CASH_INVESTED -> CASH_INVESTED, CASH_TRUE, RISK_ON
+    - CASH_TRUE -> CASH_TRUE, CASH_INVESTED, RISK_ON
 
     Args:
         rebalance_records: List of rebalance records
@@ -305,9 +319,23 @@ def validate_state_transitions(
         ValidationError: If an invalid transition occurred
     """
     allowed_transitions = {
-        MarketState.RISK_ON: {MarketState.RISK_ON, MarketState.PANIC, MarketState.DEFENSIVE_MOMENTUM, MarketState.CASH},
-        MarketState.PANIC: {MarketState.PANIC, MarketState.CASH},
-        MarketState.DEFENSIVE_MOMENTUM: {MarketState.DEFENSIVE_MOMENTUM, MarketState.CASH},  # V2 Lever A
+        MarketState.RISK_ON: {
+            MarketState.RISK_ON,
+            MarketState.PANIC,
+            MarketState.DEFENSIVE_MOMENTUM,
+            MarketState.CASH_INVESTED,
+            MarketState.CASH_TRUE,
+            MarketState.CASH,
+        },
+        MarketState.PANIC: {MarketState.PANIC, MarketState.CASH_INVESTED, MarketState.CASH_TRUE, MarketState.CASH},
+        MarketState.DEFENSIVE_MOMENTUM: {
+            MarketState.DEFENSIVE_MOMENTUM,
+            MarketState.CASH_INVESTED,
+            MarketState.CASH_TRUE,
+            MarketState.CASH,
+        },  # V2 Lever A
+        MarketState.CASH_INVESTED: {MarketState.CASH_INVESTED, MarketState.CASH_TRUE, MarketState.RISK_ON, MarketState.CASH},
+        MarketState.CASH_TRUE: {MarketState.CASH_TRUE, MarketState.CASH_INVESTED, MarketState.RISK_ON, MarketState.CASH},
         MarketState.CASH: {MarketState.CASH, MarketState.RISK_ON},
     }
 

@@ -26,10 +26,11 @@ def download_single_ticker(
     ticker: str,
     start_date: date,
     end_date: date,
+    price_column: str = "close",
     progress: bool = False,
 ) -> Optional[pd.Series]:
     """
-    Download Adj Close price series for a single ticker.
+    Download price series for a single ticker.
 
     Args:
         ticker: Yahoo Finance ticker symbol (e.g., 'RELIANCE.NS')
@@ -38,10 +39,10 @@ def download_single_ticker(
         progress: Show yfinance progress bar
 
     Returns:
-        Series of Adj Close prices indexed by date, or None if download fails
+        Series of prices indexed by date, or None if download fails
 
     Note:
-        - Uses only 'Adj Close' field as mandated
+        - Uses 'Close' or 'Adj Close' based on price_column
         - Does NOT forward-fill missing values
         - Returns None on download failure (caller handles eligibility)
     """
@@ -60,29 +61,29 @@ def download_single_ticker(
             logger.debug(f"No data returned for {ticker}")
             return None
 
-        # Extract Adj Close only
-        if "Adj Close" not in hist.columns:
-            logger.warning(f"No 'Adj Close' column for {ticker}, columns: {list(hist.columns)}")
+        column_name = "Close" if price_column == "close" else "Adj Close"
+        if column_name not in hist.columns:
+            logger.warning(f"No '{column_name}' column for {ticker}, columns: {list(hist.columns)}")
             return None
 
-        adj_close = hist["Adj Close"].copy()
+        price_series = hist[column_name].copy()
 
         # Convert index to date (remove timezone if present)
-        adj_close.index = pd.to_datetime(adj_close.index).date
-        adj_close.index = pd.DatetimeIndex(adj_close.index)
-        adj_close.name = ticker
+        price_series.index = pd.to_datetime(price_series.index).date
+        price_series.index = pd.DatetimeIndex(price_series.index)
+        price_series.name = ticker
 
         # Drop any NaN values (do NOT forward-fill)
-        adj_close = adj_close.dropna()
+        price_series = price_series.dropna()
 
-        if adj_close.empty:
+        if price_series.empty:
             logger.debug(f"All NaN values for {ticker}")
             return None
 
-        logger.debug(f"Downloaded {len(adj_close)} days for {ticker}: "
-                     f"{adj_close.index[0].date()} to {adj_close.index[-1].date()}")
+        logger.debug(f"Downloaded {len(price_series)} days for {ticker}: "
+                     f"{price_series.index[0].date()} to {price_series.index[-1].date()}")
 
-        return adj_close
+        return price_series
 
     except Exception as e:
         logger.warning(f"Failed to download {ticker}: {e}")
@@ -93,10 +94,11 @@ def download_price_data(
     tickers: List[str],
     start_date: date,
     end_date: date,
+    price_column: str = "close",
     show_progress: bool = True,
 ) -> Dict[str, pd.Series]:
     """
-    Download Adj Close price data for multiple tickers.
+    Download price data for multiple tickers.
 
     Args:
         tickers: List of Yahoo Finance ticker symbols
@@ -105,7 +107,7 @@ def download_price_data(
         show_progress: Show progress bar during download
 
     Returns:
-        Dictionary mapping ticker symbols to their Adj Close price series.
+        Dictionary mapping ticker symbols to their price series.
         Tickers that fail to download are excluded (not in dict).
 
     Note:
@@ -121,7 +123,13 @@ def download_price_data(
     iterator = tqdm(tickers, desc="Downloading", disable=not show_progress)
 
     for ticker in iterator:
-        series = download_single_ticker(ticker, start_date, end_date, progress=False)
+        series = download_single_ticker(
+            ticker,
+            start_date,
+            end_date,
+            price_column=price_column,
+            progress=False,
+        )
         if series is not None and len(series) > 0:
             results[ticker] = series
         else:
@@ -180,11 +188,13 @@ def load_price_data_from_parquet(
     tickers: List[str],
     start_date: date,
     end_date: date,
+    price_column: str = "close",
+    warn_missing: bool = True,
 ) -> Dict[str, pd.Series]:
     """
-    Load Adj Close price data from a pre-downloaded parquet file.
+    Load price data from a pre-downloaded parquet file.
 
-    Expects parquet with columns: date, adj_close, symbol (NSE format).
+    Expects parquet with columns: date, {price_column}, symbol (NSE format).
     Converts NSE symbols (RELIANCE) to Yahoo format (RELIANCE.NS).
 
     Args:
@@ -194,11 +204,19 @@ def load_price_data_from_parquet(
         end_date: End date for data
 
     Returns:
-        Dictionary mapping ticker symbols to their Adj Close price series.
+        Dictionary mapping ticker symbols to their price series.
     """
     logger.info(f"Loading price data from parquet: {parquet_path}")
 
     df = pd.read_parquet(parquet_path)
+    columns_by_lower = {column.lower(): column for column in df.columns}
+    if price_column not in columns_by_lower:
+        available = ", ".join(sorted(columns_by_lower.keys()))
+        raise ValueError(
+            f"Parquet is missing '{price_column}' column. "
+            f"Available columns: {available}"
+        )
+    price_column_name = columns_by_lower[price_column]
 
     # Convert date column to datetime and remove timezone
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
@@ -222,15 +240,21 @@ def load_price_data_from_parquet(
     # Get unique NSE symbols we need
     nse_symbols_needed = set(yahoo_to_nse.values())
 
+    # Normalize parquet symbols to NSE base (strip .NS/.BO if present)
+    symbol_series = df["symbol"].astype(str).str.strip()
+    symbol_series = symbol_series.str.replace(".NS", "", regex=False)
+    symbol_series = symbol_series.str.replace(".BO", "", regex=False)
+    df = df.assign(_nse_symbol=symbol_series)
+
     # Filter to only symbols we need
-    df = df[df["symbol"].isin(nse_symbols_needed)]
+    df = df[df["_nse_symbol"].isin(nse_symbols_needed)]
 
     results: Dict[str, pd.Series] = {}
     loaded = 0
     missing = []
 
     for yahoo_ticker, nse_symbol in yahoo_to_nse.items():
-        ticker_data = df[df["symbol"] == nse_symbol].copy()
+        ticker_data = df[df["_nse_symbol"] == nse_symbol].copy()
 
         if ticker_data.empty:
             missing.append(yahoo_ticker)
@@ -239,7 +263,7 @@ def load_price_data_from_parquet(
         # Create series with date index
         ticker_data = ticker_data.sort_values("date")
         series = pd.Series(
-            ticker_data["adj_close"].values,
+            ticker_data[price_column_name].values,
             index=pd.DatetimeIndex(ticker_data["date"].values),
             name=yahoo_ticker,
         )
@@ -256,7 +280,9 @@ def load_price_data_from_parquet(
     success_rate = loaded / len(tickers) * 100 if tickers else 0
     logger.info(f"Loaded {loaded}/{len(tickers)} tickers from parquet ({success_rate:.1f}% success)")
 
-    if missing:
-        logger.warning(f"Missing {len(missing)} tickers in parquet: {missing[:20]}{'...' if len(missing) > 20 else ''}")
+    if missing and warn_missing:
+        logger.warning(
+            f"Missing {len(missing)} tickers in parquet: {missing[:20]}{'...' if len(missing) > 20 else ''}"
+        )
 
     return results

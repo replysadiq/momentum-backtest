@@ -191,10 +191,15 @@ def _export_state_log(
 
         rows.append({
             "date": record.date.strftime("%Y-%m-%d"),
+            "prev_state": record.prev_state,
             "state": record.state.name,
             "transition": transition,
+            "transition_reason": record.transition_reason,
+            "transition_detail": record.transition_detail,
             "cash_entry_reason": record.cash_entry_reason or "",  # V3: Why CASH was entered
             "invested_flag": record.invested_flag,  # V3.1: True if holding equities
+            "invested_weight": record.invested_fraction,
+            "cash_weight": 1.0 - record.invested_fraction,
             "selected_count": record.selected_count,
             "defensive_selected_count": record.defensive_selected_count,
             "max_weight": record.max_weight,
@@ -272,6 +277,8 @@ def _export_run_manifest(
         # Benchmark
         "benchmark_ticker": benchmark_ticker,
         "benchmark_coverage": round(benchmark_coverage, 4),
+        "benchmark_role": "mom50",
+        "benchmark_used": "mom50",
 
         # Rebalance calendar
         "rebalance_rule": "first_trading_day_of_month",
@@ -310,6 +317,7 @@ def _export_run_manifest(
         # V2 Strategy levers
         "strategy_version": config.strategy_version,
         "enabled_levers": config.enabled_levers,
+        "notes": "CASH split into CASH_INVESTED and CASH_TRUE; no behavioral change",
         "v2_params": {
             "panic_defensive_mode": config.panic_defensive_mode,
             "defensive_basket_size": config.defensive_basket_size,
@@ -393,3 +401,37 @@ def export_rolling_excess_return(
             json.dump(metrics_data, f, indent=2)
 
         logger.info(f"  Updated {metrics_path} with rolling_3y_excess stats")
+
+
+def export_rolling_returns(
+    rolling_df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    """
+    Export rolling 3-year strategy vs benchmark returns.
+    """
+    if len(rolling_df) == 0:
+        logger.warning("No rolling returns data to export (insufficient history)")
+        return
+
+    csv_path = output_dir / "rolling_returns.csv"
+    export_df = rolling_df.copy()
+    export_df["date"] = pd.to_datetime(export_df["date"]).dt.strftime("%Y-%m-%d")
+    if "rolling_window_start_date" in export_df.columns:
+        export_df["rolling_window_start_date"] = pd.to_datetime(
+            export_df["rolling_window_start_date"]
+        ).dt.strftime("%Y-%m-%d")
+
+    for col in [
+        "strategy_rolling_3y_cagr",
+        "mom50_rolling_3y_cagr",
+        "rolling_3y_excess_cagr",
+        "strategy_rolling_3y_total_return",
+        "mom50_rolling_3y_total_return",
+        "rolling_3y_excess_total_return",
+    ]:
+        if col in export_df.columns:
+            export_df[col] = export_df[col].round(6)
+
+    export_df.to_csv(csv_path, index=False)
+    logger.info(f"  Wrote {csv_path} ({len(export_df)} rows)")

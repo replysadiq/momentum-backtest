@@ -120,6 +120,7 @@ def realized_vol(
     months: int,
     annualize: bool = True,
     min_samples: int = 20,
+    trading_dates: Optional[pd.DatetimeIndex] = None,
 ) -> Optional[float]:
     """
     Compute realized volatility with EXCLUSIVE end boundary.
@@ -138,17 +139,25 @@ def realized_vol(
     """
     start_date = end_date_exclusive - pd.DateOffset(months=months)
 
+    # Determine required samples from trading calendar if provided.
+    if trading_dates is not None:
+        required_samples = int(
+            ((trading_dates >= start_date) & (trading_dates < end_date_exclusive)).sum()
+        )
+    else:
+        required_samples = min_samples
+
     # Get prices strictly within [start, end)
     mask = (prices.index >= start_date) & (prices.index < end_date_exclusive)
     period_prices = prices[mask].dropna()
 
-    if len(period_prices) < min_samples:
+    if len(period_prices) < required_samples:
         return None
 
     # Compute log returns
     log_returns = np.log(period_prices / period_prices.shift(1)).dropna()
 
-    if len(log_returns) < min_samples - 1:
+    if len(log_returns) < required_samples - 1:
         return None
 
     daily_vol = log_returns.std()

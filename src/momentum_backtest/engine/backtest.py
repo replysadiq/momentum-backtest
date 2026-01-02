@@ -21,8 +21,17 @@ import numpy as np
 import pandas as pd
 
 from ..config import BacktestConfig, CashReplaceMode
-from ..data.sanitizer import get_eligible_stocks
-from .signals import rank_stocks_by_momentum, EligibilityBreakdown, select_defensive_basket
+from ..data.sanitizer import (
+    get_eligible_stocks_with_history_gate,
+    required_history_months,
+    history_gate_passes,
+)
+from .signals import (
+    rank_stocks_by_momentum,
+    EligibilityBreakdown,
+    select_defensive_basket,
+    SCORE_FAILURE_REASON_CODES,
+)
 from .portfolio import build_portfolio, build_defensive_portfolio, HoldingInfo
 from .stats import compute_turnover, apply_transaction_cost
 from .state_machine import (
@@ -34,6 +43,7 @@ from .state_machine import (
     next_state,
     compute_state_features,
     determine_initial_state,
+    is_cash_regime,
 )
 
 
@@ -50,9 +60,14 @@ class RebalanceRecord:
     weights: Dict[str, float]
     turnover: float
     transaction_cost: float
+    requested_state: str = ""
+    transition_reason: str = ""
+    transition_detail: str = ""
+    prev_state: str = ""
+    warmup_skip: bool = False
     # V3: Reason for CASH entry (None if not entering CASH this rebalance)
     cash_entry_reason: Optional[str] = None
-    # V3.1: True if actually invested (not holding cash) - for CASH state with defensive replacement
+    # V3.1: True if actually invested (not holding cash) - used for legacy CASH naming
     invested_flag: bool = False
     # V3.4: Concentration cap diagnostics
     selected_count: int = 0
@@ -62,6 +77,7 @@ class RebalanceRecord:
     invested_fraction: float = 0.0
     concentration_gate_triggered: bool = False
     concentration_gate_reason: str = ""
+    concentration_forced_cash: bool = False
 
 
 @dataclass
@@ -82,12 +98,60 @@ class EligibilityRecord:
 
 
 @dataclass
+class ScoreFailureRecord:
+    """Diagnostics for score computation failures per rebalance."""
+    date: pd.Timestamp
+    requested_state: str
+    output_state: str
+    reason_code: str
+    count: int
+    sample_symbols: str
+    sample_note: str = ""
+
+
+@dataclass
+class ScoreRejectionRecord:
+    """Diagnostics for score rejection reasons per rebalance."""
+    date: pd.Timestamp
+    attempted: int
+    ok: int
+    rejection_counts: Dict[str, int]
+    exception_hist: Dict[str, int]
+    rejection_samples: Dict[str, List[str]]
+    rejection_sample_contexts: Dict[str, List[str]]
+    short_window_samples: List[Dict[str, object]]
+
+
+@dataclass
+class EligibilityFunnelRecord:
+    """Eligibility funnel diagnostics per rebalance."""
+    date: pd.Timestamp
+    universe_count: int
+    data_eligible_count: int
+    warmup_skip: bool
+    insufficient_history_excluded: int
+    history_eligible: int
+    history_ineligible_count: int
+    score_attempted_count: int
+    score_success_count: int
+    score_computation_failed_after_gate: int
+    filter_passed_count: int
+    selected_count: int
+    invested_count: int
+    final_state: str
+    concentration_forced_cash: bool
+
+
+@dataclass
 class BacktestResult:
     """Complete result of a backtest run."""
     equity_curve: pd.Series
     benchmark_curve: pd.Series
     rebalance_records: List[RebalanceRecord]
     eligibility_records: List[EligibilityRecord]
+    score_failure_records: List[ScoreFailureRecord]
+    score_rejection_records: List[ScoreRejectionRecord]
+    eligibility_funnel_records: List[EligibilityFunnelRecord]
     config: BacktestConfig
 
     # Computed at end
@@ -96,8 +160,6 @@ class BacktestResult:
     time_in_risk_on: float = 0.0
     time_in_panic: float = 0.0
     time_in_defensive_momentum: float = 0.0  # V2 Lever A
-    time_in_cash: float = 0.0
-
     # Panic event tracking (verify PANIC conditions are firing)
     panic_events_count: int = 0  # Total times PANIC condition was triggered
     panic_vol_ratio_triggers: int = 0  # Triggered by vol_ratio > threshold
@@ -109,14 +171,30 @@ class BacktestResult:
     turnover_defensive: float = 0.0
     turnover_cash_panic: float = 0.0  # Liquidation turnover
 
-    # V3.1: Time in CASH state but actually invested (defensive replacement)
+    # V3.5: Time in explicit cash states
     time_in_cash_invested: float = 0.0
+    time_in_true_cash: float = 0.0
 
     # V3.4: Concentration diagnostics
     pct_time_concentration_gated: float = 0.0
     avg_invested_fraction_by_state: Dict[str, float] = field(default_factory=dict)
     avg_holdings_by_state: Dict[str, float] = field(default_factory=dict)
     pct_time_true_cash: float = 0.0
+    avg_cash_weight_overall: float = 0.0
+    avg_cash_weight_by_state: Dict[str, float] = field(default_factory=dict)
+
+    # Daily diagnostics
+    daily_state: pd.Series = field(default_factory=pd.Series)
+    daily_invested_weight: pd.Series = field(default_factory=pd.Series)
+    daily_cash_weight: pd.Series = field(default_factory=pd.Series)
+
+    # Daily cash exposure metrics
+    avg_cash_weight_overall_daily: float = 0.0
+    avg_cash_weight_by_state_daily: Dict[str, float] = field(default_factory=dict)
+    avg_invested_weight_by_state_daily: Dict[str, float] = field(default_factory=dict)
+    pct_time_cash_regime_daily: float = 0.0
+    pct_time_cash_true_daily: float = 0.0
+    pct_time_cash_invested_daily: float = 0.0
 
 
 # =============================================================================
@@ -200,6 +278,77 @@ def compute_segment_return(
     return portfolio_return
 
 
+def _diagnose_transition(
+    prev_state: Optional[MarketState],
+    next_state: MarketState,
+    features: StateFeatures,
+    thresholds: StateThresholds,
+    prev_cash_counter: int,
+) -> tuple[str, str]:
+    """
+    Diagnostics-only transition reason for state_log.csv.
+    """
+    if prev_state is None:
+        return "initial_state", ""
+
+    if prev_state == next_state:
+        if prev_state == MarketState.CASH_TRUE:
+            return "stay_cash", f"Bench6M={features.benchmark_return_6m:.2%}"
+        if prev_state == MarketState.PANIC:
+            return "stay_panic", f"VolRatio={features.vol_ratio:.2f} Bench3M={features.benchmark_return_3m:.2%}"
+        if prev_state == MarketState.DEFENSIVE_MOMENTUM:
+            return "stay_defensive", f"VolRatio={features.vol_ratio:.2f} Bench3M={features.benchmark_return_3m:.2%}"
+        return "stay", ""
+
+    if prev_state == MarketState.RISK_ON and next_state == MarketState.PANIC:
+        panic_dd = features.portfolio_drawdown_3m > thresholds.panic_dd_threshold
+        panic_vol = features.vol_ratio > thresholds.panic_vol_ratio
+        reasons = []
+        if panic_dd:
+            reasons.append("panic_dd")
+        if panic_vol:
+            reasons.append("panic_vol")
+        return "panic_trigger", ",".join(reasons)
+
+    if prev_state == MarketState.RISK_ON and next_state == MarketState.DEFENSIVE_MOMENTUM:
+        panic_dd = features.portfolio_drawdown_3m > thresholds.panic_dd_threshold
+        panic_vol = features.vol_ratio > thresholds.panic_vol_ratio
+        reasons = []
+        if panic_dd:
+            reasons.append("panic_dd")
+        if panic_vol:
+            reasons.append("panic_vol")
+        return "panic_intercept_defensive", ",".join(reasons)
+
+    if is_cash_regime(prev_state) and next_state == MarketState.CASH_TRUE:
+        return "stay_cash", f"Bench6M={features.benchmark_return_6m:.2%}"
+
+    if prev_state == MarketState.RISK_ON and next_state == MarketState.CASH_TRUE:
+        mode = thresholds.cash_entry_mode
+        if mode == CashEntryMode.BASELINE:
+            return "bench_6m<=0", f"Bench6M={features.benchmark_return_6m:.2%}"
+        if mode == CashEntryMode.STRICT_DUAL:
+            return "bench_6m<=0 & bench_3m<=0", (
+                f"Bench6M={features.benchmark_return_6m:.2%} "
+                f"Bench3M={features.benchmark_return_3m:.2%}"
+            )
+        if mode == CashEntryMode.STRICT_PERSIST:
+            return "persist_2", (
+                f"Bench6M={features.benchmark_return_6m:.2%} "
+                f"counter={prev_cash_counter + 1}"
+            )
+
+    if prev_state in (MarketState.PANIC, MarketState.DEFENSIVE_MOMENTUM) and next_state == MarketState.CASH_TRUE:
+        return "crisis_exit", (
+            f"VolRatio={features.vol_ratio:.2f} Bench3M={features.benchmark_return_3m:.2%}"
+        )
+
+    if is_cash_regime(prev_state) and next_state == MarketState.RISK_ON:
+        return "bench_6m>0", f"Bench6M={features.benchmark_return_6m:.2%}"
+
+    return "unknown_transition", ""
+
+
 def compute_daily_return(
     price_data: pd.DataFrame,
     weights: Dict[str, float],
@@ -269,6 +418,7 @@ def run_backtest(
     benchmark_prices: pd.Series,
     trading_dates: pd.DatetimeIndex,
     rebalance_calendar: pd.DatetimeIndex,
+    trading_calendar_prices: Optional[pd.Series] = None,
 ) -> BacktestResult:
     """
     Run the complete backtest simulation.
@@ -314,6 +464,9 @@ def run_backtest(
     equity_curve: Dict[pd.Timestamp, float] = {}
     rebalance_records: List[RebalanceRecord] = []
     eligibility_records: List[EligibilityRecord] = []
+    score_failure_records: List[ScoreFailureRecord] = []
+    score_rejection_records: List[ScoreRejectionRecord] = []
+    eligibility_funnel_records: List[EligibilityFunnelRecord] = []
     current_weights: Dict[str, float] = {}
     current_state: Optional[MarketState] = None
 
@@ -336,6 +489,12 @@ def run_backtest(
     else:
         min_required = 1
 
+    def _resolve_cash_state(state: MarketState, invested_fraction: float) -> MarketState:
+        """Resolve cash-regime states based on actual investment."""
+        if is_cash_regime(state):
+            return MarketState.CASH_INVESTED if invested_fraction > 0 else MarketState.CASH_TRUE
+        return state
+
     # Universe count for eligibility reporting
     universe_count = len(price_data.columns)
 
@@ -344,12 +503,41 @@ def run_backtest(
     bench_start_price = benchmark_prices[benchmark_prices.index >= bench_start_date].iloc[0]
     benchmark_curve = benchmark_prices / bench_start_price
 
+    required_months = required_history_months(
+        config.min_history_months,
+        config.momentum_lookback_months,
+        config.volatility_lookback_months,
+    )
+    warmup_start_date: Optional[pd.Timestamp] = None
+    if config.warmup_mode == "auto":
+        history_series = trading_calendar_prices if trading_calendar_prices is not None else benchmark_prices
+        for d in rebalance_calendar:
+            ok, _ = history_gate_passes(
+                history_series,
+                d,
+                trading_dates,
+                required_months,
+                config.history_gate_mode,
+                config.history_leniency,
+            )
+            if ok:
+                warmup_start_date = d
+                break
+        if warmup_start_date is None:
+            raise ValueError("Warmup failed: insufficient trading calendar history for any rebalance date.")
+
     # Track portfolio equity between rebalances
     last_rebalance_date: Optional[pd.Timestamp] = None
     last_rebalance_equity = equity
 
     for i, rebalance_date in enumerate(rebalance_calendar):
         logger.debug(f"Processing rebalance {i+1}/{len(rebalance_calendar)}: {rebalance_date.date()}")
+        prev_state_obj = current_state
+        prev_state_name = current_state.name if current_state is not None else ""
+        prev_cash_counter = state_context.cash_entry_counter if state_context is not None else 0
+        data_eligible_count = 0
+        if rebalance_date in price_data.index:
+            data_eligible_count = int(price_data.loc[rebalance_date].notna().sum())
 
         # Step 1: Compute portfolio return since last rebalance
         # Uses EXCLUSIVE end boundary - no lookahead
@@ -387,6 +575,92 @@ def run_backtest(
             rebalance_date,
         )
 
+        warmup_skip = (
+            config.warmup_mode == "auto"
+            and warmup_start_date is not None
+            and rebalance_date < warmup_start_date
+        )
+        if warmup_skip:
+            logger.info(
+                f"WARMUP_SKIP | date={rebalance_date.date()} | "
+                "reason=insufficient_global_history"
+            )
+            current_state = MarketState.CASH_TRUE
+            requested_state = MarketState.CASH_TRUE
+            output_state = MarketState.CASH_TRUE
+            new_weights = {}
+            selected_tickers = []
+            selected_count = 0
+            defensive_selected_count = 0
+            invested_fraction = 0.0
+            concentration_gate_triggered = False
+            concentration_gate_reason = ""
+            invested_flag = False
+
+            eligibility_records.append(EligibilityRecord(
+                date=rebalance_date,
+                state=output_state,
+                universe_count=universe_count,
+                data_eligible_count=0,
+                filter_passed_count=0,
+                selected_count=0,
+                insufficient_history=0,
+                negative_returns=0,
+                low_positive_months=0,
+                high_drawdown=0,
+                score_computation_failed=0,
+                not_in_price_data=0,
+            ))
+
+            record = RebalanceRecord(
+                date=rebalance_date,
+                state=output_state,
+                requested_state=requested_state.name,
+                transition_reason="warmup_skip",
+                transition_detail="insufficient_global_history",
+                prev_state=prev_state_name,
+                warmup_skip=True,
+                features=features,
+                tickers=selected_tickers,
+                weights=new_weights.copy(),
+                turnover=0.0,
+                transaction_cost=0.0,
+                cash_entry_reason=None,
+                invested_flag=invested_flag,
+                selected_count=selected_count,
+                defensive_selected_count=defensive_selected_count,
+                max_weight=float(config.max_weight) if config.max_weight is not None else 0.0,
+                min_required=min_required,
+                invested_fraction=invested_fraction,
+                concentration_gate_triggered=concentration_gate_triggered,
+                concentration_gate_reason=concentration_gate_reason,
+                concentration_forced_cash=False,
+            )
+            rebalance_records.append(record)
+            eligibility_funnel_records.append(EligibilityFunnelRecord(
+                date=rebalance_date,
+                universe_count=universe_count,
+                data_eligible_count=data_eligible_count,
+                warmup_skip=True,
+                insufficient_history_excluded=0,
+                history_eligible=0,
+                history_ineligible_count=0,
+                score_attempted_count=0,
+                score_success_count=0,
+                score_computation_failed_after_gate=0,
+                filter_passed_count=0,
+                selected_count=0,
+                invested_count=0,
+                final_state=output_state.name,
+                concentration_forced_cash=False,
+            ))
+
+            current_state = output_state
+            current_weights = new_weights
+            last_rebalance_date = rebalance_date
+            last_rebalance_equity = equity
+            continue
+
         # Step 4: Check for PANIC conditions (track even if intercepted)
         panic_dd = features.portfolio_drawdown_3m > thresholds.panic_dd_threshold
         panic_vol = features.vol_ratio > thresholds.panic_vol_ratio
@@ -407,6 +681,15 @@ def run_backtest(
         else:
             current_state = next_state(current_state, features, thresholds, state_context)
 
+        transition_reason, transition_detail = _diagnose_transition(
+            prev_state=prev_state_obj,
+            next_state=current_state,
+            features=features,
+            thresholds=thresholds,
+            prev_cash_counter=prev_cash_counter,
+        )
+        # Logged after output_state is resolved (to capture CASH_INVESTED/CASH_TRUE split).
+
         # Step 6: Execute based on state
         new_weights: Dict[str, float] = {}
         selected_tickers: List[str] = []
@@ -419,6 +702,13 @@ def run_backtest(
         concentration_gate_triggered = False
         concentration_gate_reason = ""
         requested_state = current_state
+        score_failure_payload = None
+        insufficient_history_excluded = 0
+        eligible_after_history = 0
+        score_computation_failed_after_gate = 0
+        filter_passed_count = 0
+        score_attempted_count = 0
+        score_success_count = 0
 
         # Convert current_weights to Series for turnover calculation
         prev_weights_series = pd.Series(current_weights) if current_weights else pd.Series(dtype=float)
@@ -426,14 +716,19 @@ def run_backtest(
         if current_state == MarketState.RISK_ON:
             invested_flag = True  # RISK_ON = invested
             # Get eligible stocks
-            eligible = get_eligible_stocks(
-                price_data,
-                rebalance_date,
-                trading_dates,
-                min_history_months=config.min_history_months,
-                momentum_lookback_months=config.momentum_lookback_months,
-                volatility_lookback_months=config.volatility_lookback_months,
+            eligible, insufficient_history_excluded, eligible_after_history = (
+                get_eligible_stocks_with_history_gate(
+                    price_data,
+                    rebalance_date,
+                    trading_dates,
+                    min_history_months=config.min_history_months,
+                    momentum_lookback_months=config.momentum_lookback_months,
+                    volatility_lookback_months=config.volatility_lookback_months,
+                    history_gate_mode=config.history_gate_mode,
+                    history_leniency=config.history_leniency,
+                )
             )
+            score_attempted_count = len(eligible)
 
             # Rank by momentum (returns RankingResult with scores and eligibility)
             # V2 Lever D: Pass disable_6m_filter
@@ -441,12 +736,30 @@ def run_backtest(
                 price_data,
                 eligible,
                 rebalance_date,
+                trading_dates=trading_dates,
                 universe_count=universe_count,
                 use_dd_filter=config.use_dd_filter,
                 dd_threshold=config.dd_threshold,
                 nse_style=config.nse_style_scoring,
                 disable_6m_filter=config.disable_6m_filter,  # V2 Lever D
             )
+
+            score_failure_payload = {
+                "breakdown": ranking_result.score_failure_breakdown,
+                "samples": ranking_result.score_failure_samples,
+                "notes": ranking_result.score_failure_notes,
+            }
+            score_success_count = len(ranking_result.scores)
+            score_rejection_records.append(ScoreRejectionRecord(
+                date=rebalance_date,
+                attempted=ranking_result.rejection_attempted,
+                ok=ranking_result.rejection_ok,
+                rejection_counts=ranking_result.rejection_counts,
+                exception_hist=ranking_result.rejection_exception_hist,
+                rejection_samples=ranking_result.rejection_samples,
+                rejection_sample_contexts=ranking_result.rejection_sample_contexts,
+                short_window_samples=ranking_result.short_window_samples,
+            ))
 
             # Build portfolio from ranked scores
             # V2 Lever B: Pass rank buffer / min hold params
@@ -469,6 +782,8 @@ def run_backtest(
 
             # Record eligibility data
             elig = ranking_result.eligibility
+            score_computation_failed_after_gate = elig.score_computation_failed
+            filter_passed_count = elig.filter_passed_count
             eligibility_records.append(EligibilityRecord(
                 date=rebalance_date,
                 state=requested_state,
@@ -488,11 +803,15 @@ def run_backtest(
             selected_tickers = allocation.tickers
             selected_count = len(allocation.tickers)
 
-            if selected_count < min_required:
+            if (
+                filter_passed_count > 0
+                and selected_count > 0
+                and selected_count < min_required
+            ):
                 concentration_gate_triggered = True
-                concentration_gate_reason = "risk_on_insufficient_breadth"
+                concentration_gate_reason = "risk_on_insufficient_concentration"
                 invested_flag = False
-                current_state = MarketState.CASH
+                current_state = MarketState.CASH_TRUE
                 new_weights = {}
                 selected_tickers = []
                 current_holdings = {}
@@ -511,13 +830,17 @@ def run_backtest(
         elif current_state == MarketState.DEFENSIVE_MOMENTUM:
             invested_flag = True  # DEFENSIVE_MOMENTUM = invested
             # V2 Lever A: Hold low-volatility stocks during panic instead of cash
-            eligible = get_eligible_stocks(
-                price_data,
-                rebalance_date,
-                trading_dates,
-                min_history_months=config.min_history_months,
-                momentum_lookback_months=config.momentum_lookback_months,
-                volatility_lookback_months=config.volatility_lookback_months,
+            eligible, insufficient_history_excluded, eligible_after_history = (
+                get_eligible_stocks_with_history_gate(
+                    price_data,
+                    rebalance_date,
+                    trading_dates,
+                    min_history_months=config.min_history_months,
+                    momentum_lookback_months=config.momentum_lookback_months,
+                    volatility_lookback_months=config.volatility_lookback_months,
+                    history_gate_mode=config.history_gate_mode,
+                    history_leniency=config.history_leniency,
+                )
             )
 
             # Select defensive basket (lowest volatility stocks with positive momentum)
@@ -527,6 +850,7 @@ def run_backtest(
                 rebalance_date,
                 basket_size=config.defensive_basket_size,
             )
+            filter_passed_count = len(defensive_scores)
 
             # Build defensive portfolio using inverse-vol weighting
             allocation = build_defensive_portfolio(
@@ -543,9 +867,13 @@ def run_backtest(
             selected_tickers = allocation.tickers
             defensive_selected_count = len(allocation.tickers)
 
-            if defensive_selected_count < min_required:
+            if (
+                filter_passed_count > 0
+                and defensive_selected_count > 0
+                and defensive_selected_count < min_required
+            ):
                 concentration_gate_triggered = True
-                concentration_gate_reason = "defensive_insufficient_breadth"
+                concentration_gate_reason = "defensive_insufficient_concentration"
                 invested_flag = False
                 new_weights = {}
                 selected_tickers = []
@@ -577,18 +905,24 @@ def run_backtest(
                 not_in_price_data=0,
             ))
 
-        elif current_state == MarketState.CASH and config.cash_replace_mode == CashReplaceMode.DEFENSIVE:
+        elif is_cash_regime(current_state) and config.cash_replace_mode == CashReplaceMode.DEFENSIVE:
             # V3.1: CASH state with defensive replacement - hold defensive portfolio
             invested_flag = True
 
-            eligible = get_eligible_stocks(
-                price_data,
-                rebalance_date,
-                trading_dates,
-                min_history_months=config.min_history_months,
-                momentum_lookback_months=config.momentum_lookback_months,
-                volatility_lookback_months=config.volatility_lookback_months,
+            eligible, insufficient_history_excluded, eligible_after_history = (
+                get_eligible_stocks_with_history_gate(
+                    price_data,
+                    rebalance_date,
+                    trading_dates,
+                    min_history_months=config.min_history_months,
+                    momentum_lookback_months=config.momentum_lookback_months,
+                    volatility_lookback_months=config.volatility_lookback_months,
+                    history_gate_mode=config.history_gate_mode,
+                    history_leniency=config.history_leniency,
+                )
             )
+            score_attempted_count = 0
+            score_success_count = 0
 
             # Select defensive basket (same as DEFENSIVE_MOMENTUM state)
             defensive_scores = select_defensive_basket(
@@ -597,6 +931,7 @@ def run_backtest(
                 rebalance_date,
                 basket_size=config.defensive_basket_size,
             )
+            filter_passed_count = len(defensive_scores)
 
             # Build defensive portfolio
             allocation = build_defensive_portfolio(
@@ -608,9 +943,13 @@ def run_backtest(
             selected_tickers = allocation.tickers
             defensive_selected_count = len(allocation.tickers)
 
-            if defensive_selected_count < min_required:
+            if (
+                filter_passed_count > 0
+                and defensive_selected_count > 0
+                and defensive_selected_count < min_required
+            ):
                 concentration_gate_triggered = True
-                concentration_gate_reason = "defensive_insufficient_breadth"
+                concentration_gate_reason = "defensive_insufficient_concentration"
                 invested_flag = False
                 new_weights = {}
                 selected_tickers = []
@@ -643,7 +982,7 @@ def run_backtest(
             ))
 
         else:
-            # PANIC or CASH (with no replacement) - liquidate to cash
+            # PANIC or CASH_TRUE (with no replacement) - liquidate to cash
             # Target weights = empty (all cash)
             target_weights_series = pd.Series(dtype=float)
 
@@ -689,6 +1028,38 @@ def run_backtest(
             concentration_gate_triggered = True
             concentration_gate_reason = "cap_left_cash"
 
+        resolved_state = _resolve_cash_state(current_state, invested_fraction)
+        if config.legacy_cash_state_names and is_cash_regime(resolved_state):
+            output_state = MarketState.CASH
+        else:
+            output_state = resolved_state
+
+        if prev_state_obj is not None and is_cash_regime(prev_state_obj) and is_cash_regime(output_state):
+            if prev_state_obj != output_state:
+                transition_reason = "cash_state_resolution"
+                transition_detail = f"invested_fraction={invested_fraction:.3f}"
+
+        if output_state == MarketState.CASH:
+            invested_flag = invested_fraction > 0
+        else:
+            invested_flag = output_state in {
+                MarketState.RISK_ON,
+                MarketState.DEFENSIVE_MOMENTUM,
+                MarketState.CASH_INVESTED,
+            }
+
+        logger.info(
+            "STATE_TRANSITION | date=%s | %s->%s | Bench6M=%.2f%% | Bench3M=%.2f%% | "
+            "VolRatio=%.2f | reason=%s",
+            rebalance_date.date(),
+            prev_state_name or "NONE",
+            output_state.name,
+            features.benchmark_return_6m * 100.0,
+            features.benchmark_return_3m * 100.0,
+            features.vol_ratio,
+            transition_reason,
+        )
+
         # Step 6: Record rebalance event
         # Capture cash_entry_reason from context (only set when entering CASH)
         cash_reason = state_context.cash_entry_reason
@@ -696,7 +1067,12 @@ def run_backtest(
 
         record = RebalanceRecord(
             date=rebalance_date,
-            state=current_state,
+            state=output_state,
+            requested_state=requested_state.name,
+            transition_reason=transition_reason,
+            transition_detail=transition_detail,
+            prev_state=prev_state_name,
+            warmup_skip=warmup_skip,
             features=features,
             tickers=selected_tickers,
             weights=new_weights.copy(),
@@ -711,10 +1087,64 @@ def run_backtest(
             invested_fraction=invested_fraction,
             concentration_gate_triggered=concentration_gate_triggered,
             concentration_gate_reason=concentration_gate_reason,
+            concentration_forced_cash=(
+                concentration_gate_triggered
+                and concentration_gate_reason in {
+                    "risk_on_insufficient_concentration",
+                    "defensive_insufficient_concentration",
+                }
+            ),
         )
         rebalance_records.append(record)
 
+        if score_failure_payload is not None:
+            for reason_code in SCORE_FAILURE_REASON_CODES:
+                count = int(score_failure_payload["breakdown"].get(reason_code, 0))
+                samples = score_failure_payload["samples"].get(reason_code, [])
+                notes = score_failure_payload["notes"].get(reason_code, "")
+                score_failure_records.append(ScoreFailureRecord(
+                    date=rebalance_date,
+                    requested_state=record.requested_state,
+                    output_state=output_state.name,
+                    reason_code=reason_code,
+                    count=count,
+                    sample_symbols=",".join(samples),
+                    sample_note=notes,
+                ))
+            score_failure_payload = None
+
+        if requested_state == MarketState.RISK_ON:
+            selected_count_funnel = selected_count
+        elif requested_state in {
+            MarketState.DEFENSIVE_MOMENTUM,
+            MarketState.CASH_TRUE,
+            MarketState.CASH_INVESTED,
+            MarketState.CASH,
+        }:
+            selected_count_funnel = defensive_selected_count
+        else:
+            selected_count_funnel = 0
+
+        eligibility_funnel_records.append(EligibilityFunnelRecord(
+            date=rebalance_date,
+            universe_count=universe_count,
+            data_eligible_count=data_eligible_count,
+            warmup_skip=warmup_skip,
+            insufficient_history_excluded=insufficient_history_excluded,
+            history_eligible=eligible_after_history,
+            history_ineligible_count=insufficient_history_excluded,
+            score_attempted_count=score_attempted_count,
+            score_success_count=score_success_count,
+            score_computation_failed_after_gate=score_computation_failed_after_gate,
+            filter_passed_count=filter_passed_count,
+            selected_count=selected_count_funnel,
+            invested_count=len(new_weights),
+            final_state=output_state.name,
+            concentration_forced_cash=record.concentration_forced_cash,
+        ))
+
         # Update tracking
+        current_state = output_state
         current_weights = new_weights
         last_rebalance_date = rebalance_date
         last_rebalance_equity = equity
@@ -742,17 +1172,21 @@ def run_backtest(
 
     n_rebalances = len(rebalance_records)
 
-    # V3.1: Count CASH periods where invested_flag=True (defensive replacement)
+    cash_states = {MarketState.CASH_INVESTED, MarketState.CASH_TRUE, MarketState.CASH}
     cash_invested_count = sum(
         1 for r in rebalance_records
-        if r.state == MarketState.CASH and r.invested_flag
+        if r.state in cash_states and r.invested_fraction > 1e-12
+    )
+    true_cash_count = sum(
+        1 for r in rebalance_records
+        if r.state in cash_states and r.invested_fraction <= 1e-12
     )
 
     concentration_gate_count = sum(1 for r in rebalance_records if r.concentration_gate_triggered)
-    true_cash_count = sum(1 for r in rebalance_records if r.invested_fraction <= 1e-12)
 
     avg_invested_fraction_by_state: Dict[str, float] = {}
     avg_holdings_by_state: Dict[str, float] = {}
+    avg_cash_weight_by_state: Dict[str, float] = {}
     for state in MarketState:
         state_records = [r for r in rebalance_records if r.state == state]
         if state_records:
@@ -762,22 +1196,54 @@ def run_backtest(
             avg_holdings_by_state[state.name] = float(
                 np.mean([len(r.weights) for r in state_records])
             )
+            avg_cash_weight_by_state[state.name] = float(
+                np.mean([1.0 - r.invested_fraction for r in state_records])
+            )
         else:
             avg_invested_fraction_by_state[state.name] = 0.0
             avg_holdings_by_state[state.name] = 0.0
+            avg_cash_weight_by_state[state.name] = 0.0
+
+    avg_cash_weight_overall = float(np.mean([1.0 - r.invested_fraction for r in rebalance_records])) if rebalance_records else 0.0
+
+    daily_state, daily_invested_weight, daily_cash_weight = _build_daily_diagnostics(
+        rebalance_records,
+        trading_dates,
+        config.end_date,
+    )
+
+    cash_regime_mask = daily_state.isin(
+        {MarketState.CASH_INVESTED.name, MarketState.CASH_TRUE.name, MarketState.CASH.name}
+    )
+    cash_invested_mask = cash_regime_mask & (daily_invested_weight > 0)
+    cash_true_mask = cash_regime_mask & (daily_invested_weight <= 0)
+
+    avg_cash_weight_overall_daily = float(daily_cash_weight.mean()) if not daily_cash_weight.empty else 0.0
+    avg_cash_weight_by_state_daily = (
+        daily_cash_weight.groupby(daily_state).mean().to_dict() if not daily_cash_weight.empty else {}
+    )
+    avg_invested_weight_by_state_daily = (
+        daily_invested_weight.groupby(daily_state).mean().to_dict() if not daily_invested_weight.empty else {}
+    )
+
+    pct_time_cash_regime_daily = float(cash_regime_mask.mean()) if len(daily_state) else 0.0
+    pct_time_cash_invested_daily = float(cash_invested_mask.mean()) if len(daily_state) else 0.0
+    pct_time_cash_true_daily = float(cash_true_mask.mean()) if len(daily_state) else 0.0
 
     result = BacktestResult(
         equity_curve=daily_equity,
         benchmark_curve=benchmark_curve,
         rebalance_records=rebalance_records,
         eligibility_records=eligibility_records,
+        score_failure_records=score_failure_records,
+        score_rejection_records=score_rejection_records,
+        eligibility_funnel_records=eligibility_funnel_records,
         config=config,
         total_turnover=total_turnover,
         total_transaction_costs=total_tc,
         time_in_risk_on=state_counts[MarketState.RISK_ON] / n_rebalances if n_rebalances else 0,
         time_in_panic=state_counts[MarketState.PANIC] / n_rebalances if n_rebalances else 0,
         time_in_defensive_momentum=state_counts[MarketState.DEFENSIVE_MOMENTUM] / n_rebalances if n_rebalances else 0,
-        time_in_cash=state_counts[MarketState.CASH] / n_rebalances if n_rebalances else 0,
         # Panic event tracking
         panic_events_count=panic_events_count,
         panic_vol_ratio_triggers=panic_vol_ratio_triggers,
@@ -787,13 +1253,25 @@ def run_backtest(
         turnover_risk_on=turnover_risk_on,
         turnover_defensive=turnover_defensive,
         turnover_cash_panic=turnover_cash_panic,
-        # V3.1: Time in CASH but invested
+        # V3.5: Explicit cash states
         time_in_cash_invested=cash_invested_count / n_rebalances if n_rebalances else 0,
+        time_in_true_cash=true_cash_count / n_rebalances if n_rebalances else 0,
         # V3.4: Concentration diagnostics
         pct_time_concentration_gated=concentration_gate_count / n_rebalances if n_rebalances else 0.0,
         avg_invested_fraction_by_state=avg_invested_fraction_by_state,
         avg_holdings_by_state=avg_holdings_by_state,
         pct_time_true_cash=true_cash_count / n_rebalances if n_rebalances else 0.0,
+        avg_cash_weight_overall=avg_cash_weight_overall,
+        avg_cash_weight_by_state=avg_cash_weight_by_state,
+        daily_state=daily_state,
+        daily_invested_weight=daily_invested_weight,
+        daily_cash_weight=daily_cash_weight,
+        avg_cash_weight_overall_daily=avg_cash_weight_overall_daily,
+        avg_cash_weight_by_state_daily=avg_cash_weight_by_state_daily,
+        avg_invested_weight_by_state_daily=avg_invested_weight_by_state_daily,
+        pct_time_cash_regime_daily=pct_time_cash_regime_daily,
+        pct_time_cash_invested_daily=pct_time_cash_invested_daily,
+        pct_time_cash_true_daily=pct_time_cash_true_daily,
     )
 
     # Build log message with state distribution
@@ -801,7 +1279,7 @@ def run_backtest(
                  f"PANIC={result.time_in_panic:.1%}")
     if result.time_in_defensive_momentum > 0:
         state_log += f", DEFENSIVE_MOMENTUM={result.time_in_defensive_momentum:.1%}"
-    state_log += f", CASH={result.time_in_cash:.1%}"
+    state_log += f", CASH_INVESTED={result.time_in_cash_invested:.1%}, CASH_TRUE={result.time_in_true_cash:.1%}"
 
     # Log panic events (verify PANIC conditions are firing)
     if panic_events_count > 0:
@@ -894,3 +1372,45 @@ def _build_daily_equity(
             daily_equity[current_date] = current_equity
 
     return daily_equity.dropna()
+
+
+def _build_daily_diagnostics(
+    records: List[RebalanceRecord],
+    trading_dates: pd.DatetimeIndex,
+    backtest_end_date: date,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Build daily state and cash exposure series based on rebalance records.
+
+    Returns:
+        Tuple of (daily_state, daily_invested_weight, daily_cash_weight)
+    """
+    if not records:
+        empty = pd.Series(dtype=float)
+        return empty, empty, empty
+
+    start_date = records[0].date
+    end_date = pd.Timestamp(backtest_end_date)
+    period_dates = trading_dates[
+        (trading_dates >= start_date) & (trading_dates <= end_date)
+    ]
+
+    daily_state = pd.Series(index=period_dates, dtype=object)
+    daily_invested_weight = pd.Series(index=period_dates, dtype=float)
+    daily_cash_weight = pd.Series(index=period_dates, dtype=float)
+
+    record_idx = 0
+    current_state = records[0].state
+    current_invested = records[0].invested_fraction
+
+    for current_date in period_dates:
+        if record_idx < len(records) and current_date >= records[record_idx].date:
+            current_state = records[record_idx].state
+            current_invested = records[record_idx].invested_fraction
+            record_idx += 1
+
+        daily_state[current_date] = current_state.name
+        daily_invested_weight[current_date] = current_invested
+        daily_cash_weight[current_date] = 1.0 - current_invested
+
+    return daily_state, daily_invested_weight, daily_cash_weight

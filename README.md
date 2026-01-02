@@ -2,7 +2,7 @@
 
 **Regime-Aware Momentum with Defensive Replacement**
 
-A tactical momentum strategy backtesting framework for Indian equities (NIFTY 500 universe) with state-machine-based risk management.
+A tactical momentum strategy backtesting framework for Indian equities with state-machine-based risk management.
 
 ---
 
@@ -17,7 +17,7 @@ It is designed to **optimize the asymmetry between upside participation and down
 
 ## 2. Universe and Rebalancing
 
-* **Universe:** Broad Indian equity universe (NIFTY 500–style breadth)
+* **Universe:** Broad Indian equity universe
 * **Selection:** Top-ranked momentum stocks based on multi-horizon risk-adjusted returns
 * **Portfolio Size:** 30 stocks (balance between diversification and signal strength)
 * **Rebalance Frequency:** **Every 2 months**
@@ -35,25 +35,22 @@ The strategy operates through a **state machine**, not a static allocation:
 |-------|---------|-------------------|
 | RISK_ON | Clean momentum regime | Full momentum portfolio |
 | DEFENSIVE_MOMENTUM | Volatility shock / fragile trend | Defensive momentum basket |
-| CASH (Regime Label) | Macro momentum deterioration | **Defensive replacement portfolio (not zero exposure)** |
+| CASH_INVESTED | Capital protection regime | Defensive replacement portfolio |
+| CASH_TRUE | Capital protection regime | True cash (no equity exposure) |
 
-**Critical clarification:**
-"CASH" is **not literal cash**. It represents a **capital-preservation regime**, implemented via a defensive equity basket.
-
-This ensures the strategy remains economically invested while materially reducing downside exposure.
+**Migration note (v3.5):**
+The legacy ambiguous CASH state was split into **CASH_INVESTED** and **CASH_TRUE** for clear auditability. No behavioral change.
+Use `--legacy-cash-state-names` if you need the old `CASH` label for downstream tooling.
 
 ---
 
 ## 4. Benchmarking Philosophy
 
-Two benchmarks are used, each for a distinct purpose:
+Single benchmark used for regime signals and diagnostics:
 
-1. **NIFTY 500 (primary benchmark)**
-   * Used for market regime signals
-   * Used to assess absolute drawdown control
-
-2. **NIFTY500 Momentum 50 (comparison benchmark)**
-   * Used **only** for relative performance diagnostics
+1. **Momentum 50 (Mom50)**
+   * Used for market regime signals and trading calendar
+   * Used for relative performance diagnostics
    * Represents a fully invested, high-octane momentum factor
 
 The strategy is **not designed to dominate Momentum-50 in all regimes**.
@@ -109,7 +106,7 @@ Any comparison that ignores capture ratios is **incomplete**.
 
 ### Performance Summary (2011-2025, 14+ years)
 
-| Metric | Strategy | NIFTY 500 Mom 50 |
+| Metric | Strategy | Mom50 |
 |--------|----------|------------------|
 | CAGR | 19.11% | 19.11% |
 | Max Drawdown | 21.28% | ~40% |
@@ -186,7 +183,7 @@ pip install -r requirements.txt
 
 ### 1. Stock Universe (CSV)
 
-A CSV file listing the stock tickers to consider. Example: `data/nse_nifty500_current.csv`
+A CSV file listing the stock tickers to consider. Example: `data/universe.csv`
 
 ```csv
 Symbol
@@ -215,11 +212,7 @@ OHLCV data in Parquet format with the following columns:
 
 ### 3. Benchmark Data
 
-The system automatically downloads benchmark data from Yahoo Finance:
-- Primary: `^CRSLDX` (NIFTY 500 Index)
-- Fallback: `^NSEI` (NIFTY 50 Index)
-
-Alternatively, provide a local CSV with `--benchmark-csv`:
+Provide a local Mom50 benchmark file (parquet or CSV) via `--benchmark-csv` or `--benchmark-parquet`:
 
 ```csv
 Date,Close
@@ -236,7 +229,7 @@ Date,Close
 
 ```bash
 python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
+  --tickers-csv data/universe.csv \
   --parquet-file data/ohlcv_mcap5k.parquet \
   --start 2011-01-01 \
   --end 2025-12-31 \
@@ -247,7 +240,7 @@ python -m momentum_backtest \
   --defensive-basket-size 30 \
   --cash-replace-mode defensive \
   --tc-bps 10 \
-  --comparison-benchmark-csv data/nifty500_momentum50_benchmark.csv \
+  --comparison-benchmark-csv data/mom50_benchmark.csv \
   --output-dir output/v3_recommended
 ```
 
@@ -256,7 +249,7 @@ python -m momentum_backtest \
 ```bash
 # Legacy (close)
 python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
+  --tickers-csv data/universe.csv \
   --parquet-file data/ohlcv_yahoo.parquet \
   --price-column close \
   --start 2016-01-01 \
@@ -265,7 +258,7 @@ python -m momentum_backtest \
 
 # vNext (adj_close)
 python -m momentum_backtest \
-  --tickers-csv data/nse_nifty500_current.csv \
+  --tickers-csv data/universe.csv \
   --parquet-file data/ohlcv_yahoo.parquet \
   --price-column adj_close \
   --start 2016-01-01 \
@@ -310,7 +303,7 @@ python -m momentum_backtest \
 | Argument | Description |
 |----------|-------------|
 | `--benchmark-csv` | Path to local benchmark CSV (used for state machine signals) |
-| `--comparison-benchmark-csv` | Secondary benchmark for performance comparison (e.g., NIFTY 500 Momentum 50) |
+| `--comparison-benchmark-csv` | Secondary benchmark for performance comparison (e.g., Mom50) |
 
 ---
 
@@ -344,10 +337,9 @@ The strategy uses a **4-state machine** evaluated at each rebalance:
             Benchmark 3M return < -5%
                            │
                            ▼
-                     ┌─────────────┐
-                     │    CASH     │
-                     │ (Defensive) │
-                     └──────┬──────┘
+                     ┌────────────────────┐
+                     │ CASH_INVESTED/TRUE │
+                     └─────────┬──────────┘
                             │
             Benchmark 6M > 0% AND 3M > 0%
                             │
@@ -359,16 +351,15 @@ The strategy uses a **4-state machine** evaluated at each rebalance:
 
 ### V3.1: Cash Replace Mode
 
-| Mode | CASH State Behavior |
-|------|---------------------|
-| `none` | Hold actual cash (T-bill yield) |
-| `defensive` | Hold defensive momentum basket |
+| Mode | Cash Regime Behavior |
+|------|----------------------|
+| `none` | CASH_TRUE (hold actual cash) |
+| `defensive` | CASH_INVESTED (hold defensive momentum basket) |
 
 When `--cash-replace-mode defensive`:
-- CASH remains as the regime label (for audit)
+- Cash regime is explicitly labeled as CASH_INVESTED
 - Portfolio holds defensive low-volatility stocks
-- `invested_flag=True` in state_log.csv
-- `time_in_cash_invested` reported in metrics.json
+- `pct_time_cash_invested` reported in metrics.json
 
 ### State Thresholds
 
@@ -475,9 +466,9 @@ momentum_no_indicator/
 │   ├── validate_v31_implementation.py
 │   └── run_cash_replace_ablation.py
 ├── data/
-│   ├── nse_nifty500_current.csv
+│   ├── universe.csv
 │   ├── ohlcv_mcap5k.parquet
-│   └── nifty500_momentum50_benchmark.csv
+│   └── mom50_benchmark.csv
 ├── output/
 └── README.md
 ```
@@ -488,7 +479,7 @@ momentum_no_indicator/
 
 ### Survivorship Bias Warning
 
-The backtest uses **current** NIFTY 500 constituents for the entire period. This introduces survivorship bias that may overstate returns by 1-3% annually.
+The backtest uses **current** constituents for the entire period. This introduces survivorship bias that may overstate returns by 1-3% annually.
 
 ### Transaction Costs
 

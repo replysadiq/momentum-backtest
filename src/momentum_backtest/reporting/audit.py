@@ -75,7 +75,7 @@ def export_benchmark_info(
 
     Args:
         benchmark_ticker: The selected benchmark ticker
-        is_proxy: Whether using NIFTY 50 as proxy
+    is_proxy: Whether using a proxy benchmark
         coverage: Coverage percentage
         benchmark_data: The benchmark price series
         backtest_start: Backtest start date
@@ -89,8 +89,8 @@ def export_benchmark_info(
     proxy_warning = ""
     if is_proxy:
         proxy_warning = (
-            "WARNING: Using NIFTY 50 (^NSEI) as proxy for NIFTY 500. "
-            "Calendar and regime decisions may differ from true NIFTY 500 behavior."
+            "WARNING: Using a proxy benchmark. "
+            "Calendar and regime decisions may differ from the intended benchmark."
         )
 
     info = BenchmarkInfo(

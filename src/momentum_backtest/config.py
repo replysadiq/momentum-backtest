@@ -60,7 +60,7 @@ class BacktestConfig:
     All optional parameters have sensible defaults matching the specification.
     """
 
-    # Optional: path to CSV file with NIFTY 500 tickers
+    # Optional: path to CSV file with universe tickers
     tickers_csv: Optional[Path]
 
     # Price column to use for returns/volatility computations
@@ -77,6 +77,10 @@ class BacktestConfig:
     min_history_months: int = 13
     momentum_lookback_months: int = 12
     volatility_lookback_months: int = 6
+    # History gate + warmup behavior
+    history_gate_mode: str = "strict"  # strict|lenient
+    history_leniency: float = 0.20
+    warmup_mode: str = "auto"  # off|auto
 
     # Portfolio parameters
     top_n_stocks: int = 20
@@ -126,12 +130,14 @@ class BacktestConfig:
     # V3.1: Cash replacement mode (none, defensive)
     cash_replace_mode: CashReplaceMode = CashReplaceMode.NONE
 
+    # V3.5: Legacy CASH naming for compatibility
+    legacy_cash_state_names: bool = False
+
     @property
     def strategy_version(self) -> str:
         """Compute strategy version based on enabled levers."""
-        # V3.4: concentration cap (always on when configured)
-        if self.max_weight is not None:
-            return "v3.4"
+        # V3.5: explicit cash states
+        return "v3.5"
         # V3.1: cash_replace_mode != none
         if self.cash_replace_mode != CashReplaceMode.NONE:
             return "v3.1"
@@ -169,6 +175,8 @@ class BacktestConfig:
         # V3.4: concentration cap
         if self.max_weight is not None:
             levers.append(f"V3.4:max_weight_cap({self.max_weight:.2f})")
+        # V3.5: explicit cash states
+        levers.append("V3.5:explicit_cash_states")
         return levers
 
     def __post_init__(self) -> None:
@@ -190,6 +198,12 @@ class BacktestConfig:
             raise ValueError("momentum_lookback_months must be >= 1")
         if self.volatility_lookback_months < 1:
             raise ValueError("volatility_lookback_months must be >= 1")
+        if self.history_gate_mode not in ("strict", "lenient"):
+            raise ValueError("history_gate_mode must be 'strict' or 'lenient'")
+        if not (0.0 <= self.history_leniency <= 0.5):
+            raise ValueError("history_leniency must be in [0.0, 0.5]")
+        if self.warmup_mode not in ("off", "auto"):
+            raise ValueError("warmup_mode must be 'off' or 'auto'")
 
         # Validate numeric parameters
         if self.top_n_stocks < 1:

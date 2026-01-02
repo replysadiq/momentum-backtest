@@ -50,7 +50,11 @@ class PerformanceMetrics:
     time_in_risk_on: float
     time_in_panic: float
     time_in_defensive_momentum: float  # V2 Lever A
-    time_in_cash: float
+    pct_time_cash_invested: float
+    pct_time_true_cash: float
+    pct_time_cash_regime_daily: float
+    pct_time_cash_invested_daily: float
+    pct_time_cash_true_daily: float
     total_turnover: float
     total_transaction_costs: float
 
@@ -80,13 +84,17 @@ class PerformanceMetrics:
 
     # V3.1: Cash replacement mode and invested time
     cash_replace_mode: str = "none"
-    time_in_cash_invested: float = 0.0  # Fraction of CASH periods with defensive investment
+    time_in_cash_invested: float = 0.0  # Legacy field (kept for backward compatibility)
 
     # V3.4: Concentration diagnostics
     pct_time_concentration_gated: float = 0.0
     avg_invested_fraction_by_state: dict = field(default_factory=dict)
     avg_holdings_by_state: dict = field(default_factory=dict)
-    pct_time_true_cash: float = 0.0
+    avg_cash_weight_overall_rebalance: float = 0.0
+    avg_cash_weight_overall_daily: float = 0.0
+    avg_cash_weight_by_state: dict = field(default_factory=dict)
+    avg_cash_weight_by_state_daily: dict = field(default_factory=dict)
+    avg_invested_weight_by_state_daily: dict = field(default_factory=dict)
 
 
 def compute_metrics(
@@ -94,7 +102,11 @@ def compute_metrics(
     benchmark_curve: pd.Series,
     time_in_risk_on: float,
     time_in_panic: float,
-    time_in_cash: float,
+    pct_time_cash_invested: float,
+    pct_time_true_cash: float,
+    pct_time_cash_regime_daily: float,
+    pct_time_cash_invested_daily: float,
+    pct_time_cash_true_daily: float,
     total_turnover: float,
     total_transaction_costs: float,
     risk_free_rate: float = 0.0,
@@ -118,7 +130,11 @@ def compute_metrics(
     pct_time_concentration_gated: float = 0.0,
     avg_invested_fraction_by_state: Optional[dict] = None,
     avg_holdings_by_state: Optional[dict] = None,
-    pct_time_true_cash: float = 0.0,
+    avg_cash_weight_overall_rebalance: float = 0.0,
+    avg_cash_weight_overall_daily: float = 0.0,
+    avg_cash_weight_by_state: Optional[dict] = None,
+    avg_cash_weight_by_state_daily: Optional[dict] = None,
+    avg_invested_weight_by_state_daily: Optional[dict] = None,
 ) -> PerformanceMetrics:
     """
     Compute comprehensive performance metrics.
@@ -128,7 +144,8 @@ def compute_metrics(
         benchmark_curve: Daily benchmark equity curve
         time_in_risk_on: Fraction of time in RISK_ON state
         time_in_panic: Fraction of time in PANIC state
-        time_in_cash: Fraction of time in CASH state
+    pct_time_cash_invested: Fraction of time in CASH_INVESTED state
+    pct_time_true_cash: Fraction of time in CASH_TRUE state
         total_turnover: Cumulative portfolio turnover
         total_transaction_costs: Cumulative transaction costs
         risk_free_rate: Annual risk-free rate for Sharpe/Sortino
@@ -145,6 +162,12 @@ def compute_metrics(
         avg_invested_fraction_by_state = {}
     if avg_holdings_by_state is None:
         avg_holdings_by_state = {}
+    if avg_cash_weight_by_state is None:
+        avg_cash_weight_by_state = {}
+    if avg_cash_weight_by_state_daily is None:
+        avg_cash_weight_by_state_daily = {}
+    if avg_invested_weight_by_state_daily is None:
+        avg_invested_weight_by_state_daily = {}
     # Align equity curves to common dates
     common_dates = equity_curve.index.intersection(benchmark_curve.index)
     equity = equity_curve.reindex(common_dates)
@@ -197,7 +220,11 @@ def compute_metrics(
         time_in_risk_on=time_in_risk_on,
         time_in_panic=time_in_panic,
         time_in_defensive_momentum=time_in_defensive_momentum,
-        time_in_cash=time_in_cash,
+        pct_time_cash_invested=pct_time_cash_invested,
+        pct_time_true_cash=pct_time_true_cash,
+        pct_time_cash_regime_daily=pct_time_cash_regime_daily,
+        pct_time_cash_invested_daily=pct_time_cash_invested_daily,
+        pct_time_cash_true_daily=pct_time_cash_true_daily,
         total_turnover=total_turnover,
         total_transaction_costs=total_transaction_costs,
         start_date=start_date.strftime("%Y-%m-%d"),
@@ -222,7 +249,11 @@ def compute_metrics(
         pct_time_concentration_gated=pct_time_concentration_gated,
         avg_invested_fraction_by_state=avg_invested_fraction_by_state,
         avg_holdings_by_state=avg_holdings_by_state,
-        pct_time_true_cash=pct_time_true_cash,
+        avg_cash_weight_overall_rebalance=avg_cash_weight_overall_rebalance,
+        avg_cash_weight_overall_daily=avg_cash_weight_overall_daily,
+        avg_cash_weight_by_state=avg_cash_weight_by_state,
+        avg_cash_weight_by_state_daily=avg_cash_weight_by_state_daily,
+        avg_invested_weight_by_state_daily=avg_invested_weight_by_state_daily,
     )
 
     return metrics
@@ -440,7 +471,8 @@ def format_metrics_table(metrics: PerformanceMetrics) -> str:
         lines.append(f"  DEFENSIVE_MOM:    {metrics.time_in_defensive_momentum:>10.1%}")
 
     lines.extend([
-        f"  CASH:             {metrics.time_in_cash:>10.1%}",
+        f"  CASH_INVESTED:    {metrics.pct_time_cash_invested:>10.1%}",
+        f"  CASH_TRUE:        {metrics.pct_time_true_cash:>10.1%}",
         "",
         "TRADING ACTIVITY",
         "-" * 30,
@@ -583,6 +615,80 @@ def compute_rolling_excess_return(
     )
 
     return df, stats
+
+
+def compute_rolling_returns(
+    equity_curve: pd.Series,
+    benchmark_curve: pd.Series,
+    rebalance_dates: pd.DatetimeIndex,
+    window_months: int = 36,
+) -> pd.DataFrame:
+    """
+    Compute rolling 3-year CAGR and total return for strategy and benchmark.
+
+    Uses rebalance_dates as monthly observation points.
+    """
+    if len(rebalance_dates) == 0:
+        return pd.DataFrame(columns=[
+            "date",
+            "strategy_rolling_3y_cagr",
+            "mom50_rolling_3y_cagr",
+            "rolling_3y_excess_cagr",
+            "strategy_rolling_3y_total_return",
+            "mom50_rolling_3y_total_return",
+        ])
+
+    dates = pd.to_datetime(rebalance_dates)
+    equity = equity_curve.reindex(dates).dropna()
+    bench = benchmark_curve.reindex(dates).dropna()
+
+    common_dates = equity.index.intersection(bench.index)
+    if len(common_dates) == 0:
+        return pd.DataFrame(columns=[
+            "date",
+            "strategy_rolling_3y_cagr",
+            "mom50_rolling_3y_cagr",
+            "rolling_3y_excess_cagr",
+            "strategy_rolling_3y_total_return",
+            "mom50_rolling_3y_total_return",
+        ])
+
+    equity = equity.reindex(common_dates)
+    bench = bench.reindex(common_dates)
+
+    records = []
+    for end_date in common_dates:
+        start_date_target = end_date - pd.DateOffset(months=window_months)
+        start_candidates = common_dates[common_dates <= start_date_target]
+        if len(start_candidates) == 0:
+            continue
+        start_date = start_candidates[-1]
+
+        strat_start = equity.loc[start_date]
+        strat_end = equity.loc[end_date]
+        bench_start = bench.loc[start_date]
+        bench_end = bench.loc[end_date]
+
+        if strat_start <= 0 or bench_start <= 0:
+            continue
+
+        strat_total = (strat_end / strat_start) - 1.0
+        bench_total = (bench_end / bench_start) - 1.0
+        strat_cagr = (strat_end / strat_start) ** (12.0 / window_months) - 1.0
+        bench_cagr = (bench_end / bench_start) ** (12.0 / window_months) - 1.0
+
+        records.append({
+            "date": end_date,
+            "rolling_window_start_date": start_date,
+            "strategy_rolling_3y_cagr": strat_cagr,
+            "mom50_rolling_3y_cagr": bench_cagr,
+            "rolling_3y_excess_cagr": strat_cagr - bench_cagr,
+            "strategy_rolling_3y_total_return": strat_total,
+            "mom50_rolling_3y_total_return": bench_total,
+            "rolling_3y_excess_total_return": strat_total - bench_total,
+        })
+
+    return pd.DataFrame(records)
 
 
 def _compute_longest_negative_streak(series: pd.Series) -> int:

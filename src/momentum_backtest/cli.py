@@ -61,7 +61,7 @@ Examples:
         "--tickers-csv",
         type=Path,
         default=None,
-        help="Path to CSV file with NIFTY 500 ticker list. "
+        help="Path to CSV file with the ticker universe. "
              "Optional when --parquet-file is provided.",
     )
 
@@ -72,6 +72,18 @@ Examples:
         default=None,
         help="Path to parquet file with pre-downloaded OHLCV data. "
              "If provided, skips Yahoo Finance download.",
+    )
+    parser.add_argument(
+        "--trading-calendar-parquet",
+        type=Path,
+        default=None,
+        help="Parquet file used to derive the trading calendar (optional).",
+    )
+    parser.add_argument(
+        "--trading-calendar-csv",
+        type=Path,
+        default=None,
+        help="CSV file used to derive the trading calendar (optional).",
     )
     parser.add_argument(
         "--price-column",
@@ -87,9 +99,16 @@ Examples:
         "--benchmark-csv",
         type=Path,
         default=None,
-        help="Path to CSV or parquet file with primary benchmark index data (Date,Close columns). "
+        help="Path to CSV file with primary benchmark index data (Date,Close columns). "
              "Used for trading calendar and state machine signals. "
              "If not provided, downloads from Yahoo Finance.",
+    )
+    parser.add_argument(
+        "--benchmark-parquet",
+        type=Path,
+        default=None,
+        help="Path to parquet file with primary benchmark index data (date,close/adj_close columns). "
+             "Used for trading calendar and state machine signals.",
     )
     parser.add_argument(
         "--comparison-benchmark-csv",
@@ -97,7 +116,14 @@ Examples:
         default=None,
         help="Path to CSV file with comparison benchmark (Date,Close columns). "
              "Used ONLY for performance comparison in metrics, not for signals. "
-             "Useful for comparing against factor indices like NIFTY500 Momentum 50.",
+             "Useful for comparing against factor indices like Mom50.",
+    )
+    parser.add_argument(
+        "--comparison-benchmark-parquet",
+        type=Path,
+        default=None,
+        help="Path to parquet file with comparison benchmark (date,close/adj_close columns). "
+             "Used ONLY for performance comparison in metrics, not for signals.",
     )
 
     # Output
@@ -141,6 +167,24 @@ Examples:
         default=6,
         help="Volatility lookback window (months). Default: 6",
     )
+    parser.add_argument(
+        "--history-gate-mode",
+        choices=["strict", "lenient"],
+        default="strict",
+        help="History eligibility gate mode (strict|lenient). Default: strict",
+    )
+    parser.add_argument(
+        "--history-leniency",
+        type=float,
+        default=0.20,
+        help="Leniency for history gate in lenient mode (0.0 to 0.5). Default: 0.20",
+    )
+    parser.add_argument(
+        "--warmup-mode",
+        choices=["off", "auto"],
+        default="auto",
+        help="Warm-up handling for early rebalances (off|auto). Default: auto",
+    )
 
     # Portfolio parameters
     parser.add_argument(
@@ -173,7 +217,7 @@ Examples:
     parser.add_argument(
         "--nse-style",
         action="store_true",
-        help="Use NSE NIFTY500 Momentum 50 scoring methodology "
+        help="Use Momentum 50 scoring methodology "
              "(Z-score normalized, 50/50 6M/12M weighting)",
     )
 
@@ -296,6 +340,11 @@ Examples:
              "'defensive' = hold defensive momentum portfolio instead of cash. "
              "(default: none)",
     )
+    v3_group.add_argument(
+        "--legacy-cash-state-names",
+        action="store_true",
+        help="V3.5: Emit legacy CASH state names in logs/exports for backward compatibility.",
+    )
 
     return parser.parse_args(args)
 
@@ -349,6 +398,9 @@ def build_config(args: argparse.Namespace) -> BacktestConfig:
         "min_history_months": args.min_history_months,
         "momentum_lookback_months": args.momentum_lookback_months,
         "volatility_lookback_months": args.volatility_lookback_months,
+        "history_gate_mode": args.history_gate_mode,
+        "history_leniency": args.history_leniency,
+        "warmup_mode": args.warmup_mode,
         # V2 levers
         "panic_defensive_mode": args.panic_defensive_mode,
         "defensive_basket_size": args.defensive_basket_size,
@@ -360,6 +412,8 @@ def build_config(args: argparse.Namespace) -> BacktestConfig:
         "cash_entry_mode": CashEntryMode(args.cash_entry_mode),
         # V3.1 levers
         "cash_replace_mode": CashReplaceMode(args.cash_replace_mode),
+        # V3.5 compatibility
+        "legacy_cash_state_names": args.legacy_cash_state_names,
     }
 
     # Add dates if specified

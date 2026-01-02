@@ -5,7 +5,8 @@ States:
 - RISK_ON: Actively invested in momentum portfolio
 - PANIC: Emergency exit due to volatility or drawdown
 - DEFENSIVE_MOMENTUM: Low-vol stocks during panic (V2 Lever A)
-- CASH: Defensive cash position due to negative benchmark trend
+- CASH_INVESTED: Cash regime, but invested in defensive replacement basket
+- CASH_TRUE: Cash regime, truly in cash (no equity exposure)
 
 No hidden globals. All state transitions are deterministic based on inputs.
 Uses the canonical stats module for return/volatility computations.
@@ -56,7 +57,14 @@ class MarketState(Enum):
     RISK_ON = auto()
     PANIC = auto()
     DEFENSIVE_MOMENTUM = auto()  # V2: Low-vol stocks when panic triggered
-    CASH = auto()
+    CASH_INVESTED = auto()
+    CASH_TRUE = auto()
+    CASH = auto()  # Legacy alias (do not emit by default)
+
+
+def is_cash_regime(state: MarketState) -> bool:
+    """Return True if state is any cash-regime variant."""
+    return state in {MarketState.CASH_INVESTED, MarketState.CASH_TRUE, MarketState.CASH}
 
 
 class CashEntryMode(Enum):
@@ -174,7 +182,7 @@ def next_state(
             - Vol(1M) < panic_exit_vol_ratio * Vol(6M) (1.5x) AND
             - Benchmark 3M return > panic_exit_bench_ret (-5%)
 
-    From CASH:
+    From CASH_*:
         -> RISK_ON only if:
             - Benchmark 6M return > 0
 
@@ -205,7 +213,7 @@ def next_state(
     elif prev_state == MarketState.DEFENSIVE_MOMENTUM:
         return _transition_from_defensive_momentum(features, thresholds, context)
 
-    elif prev_state == MarketState.CASH:
+    elif is_cash_regime(prev_state):
         # Reset cash counter when we're in CASH (we've already entered)
         context.reset_cash_counter()
         return _transition_from_cash(features, thresholds)
@@ -248,7 +256,7 @@ def _transition_from_risk_on(
         if baseline_cash_condition:
             context.set_cash_reason("bench_6m<=0")
             logger.info(f"RISK_ON -> CASH [baseline]: Bench6M={features.benchmark_return_6m:.1%}<=0")
-            return MarketState.CASH
+            return MarketState.CASH_TRUE
 
     elif mode == CashEntryMode.STRICT_DUAL:
         # Require BOTH 6M AND 3M returns <= 0
@@ -259,7 +267,7 @@ def _transition_from_risk_on(
                 f"RISK_ON -> CASH [strict_dual]: Bench6M={features.benchmark_return_6m:.1%}<=0, "
                 f"Bench3M={features.benchmark_return_3m:.1%}<=0"
             )
-            return MarketState.CASH
+            return MarketState.CASH_TRUE
         elif baseline_cash_condition:
             # Log when baseline would have triggered but strict_dual blocked it
             logger.debug(
@@ -278,7 +286,7 @@ def _transition_from_risk_on(
                     f"RISK_ON -> CASH [strict_persist]: Bench6M={features.benchmark_return_6m:.1%}<=0 "
                     f"for {context.cash_entry_counter} consecutive periods"
                 )
-                return MarketState.CASH
+                return MarketState.CASH_TRUE
             else:
                 logger.debug(
                     f"RISK_ON: strict_persist pending "
@@ -310,7 +318,7 @@ def _transition_from_panic(
             f"PANIC -> CASH: VolRatio={features.vol_ratio:.2f}<{thresholds.panic_exit_vol_ratio:.1f}, "
             f"Bench3M={features.benchmark_return_3m:.1%}>{thresholds.panic_exit_bench_ret:.0%}"
         )
-        return MarketState.CASH
+        return MarketState.CASH_TRUE
 
     # Stay in PANIC
     return MarketState.PANIC
@@ -333,7 +341,7 @@ def _transition_from_defensive_momentum(
             f"DEFENSIVE_MOMENTUM -> CASH: VolRatio={features.vol_ratio:.2f}<{thresholds.panic_exit_vol_ratio:.1f}, "
             f"Bench3M={features.benchmark_return_3m:.1%}>{thresholds.panic_exit_bench_ret:.0%}"
         )
-        return MarketState.CASH
+        return MarketState.CASH_TRUE
 
     # Stay in DEFENSIVE_MOMENTUM
     return MarketState.DEFENSIVE_MOMENTUM
@@ -351,7 +359,7 @@ def _transition_from_cash(
         return MarketState.RISK_ON
 
     # Stay in CASH
-    return MarketState.CASH
+    return MarketState.CASH_TRUE
 
 
 def compute_state_features(
@@ -446,7 +454,7 @@ def determine_initial_state(
         if baseline_cash_condition:
             context.set_cash_reason("bench_6m<=0")
             logger.info(f"Initial state: CASH [baseline] (Bench6M={features.benchmark_return_6m:.1%})")
-            return MarketState.CASH
+            return MarketState.CASH_TRUE
 
     elif mode == CashEntryMode.STRICT_DUAL:
         dual_condition = baseline_cash_condition and features.benchmark_return_3m <= 0
@@ -454,7 +462,7 @@ def determine_initial_state(
             context.set_cash_reason("bench_6m<=0 & bench_3m<=0")
             logger.info(f"Initial state: CASH [strict_dual] (Bench6M={features.benchmark_return_6m:.1%}, "
                         f"Bench3M={features.benchmark_return_3m:.1%})")
-            return MarketState.CASH
+            return MarketState.CASH_TRUE
 
     elif mode == CashEntryMode.STRICT_PERSIST:
         # For strict_persist, we can't enter CASH on first check (need 2 consecutive)

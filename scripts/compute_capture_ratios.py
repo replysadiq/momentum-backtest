@@ -32,12 +32,18 @@ def load_data(output_dir: str, mom50_path: str):
     rebalance_log = pd.read_csv(output_path / "rebalance_log.csv", parse_dates=["date"])
     rebalance_dates = rebalance_log["date"].tolist()
 
+    # Load eligibility coverage (rebalance-level)
+    eligibility_path = output_path / "eligibility_coverage.csv"
+    eligibility_df = None
+    if eligibility_path.exists():
+        eligibility_df = pd.read_csv(eligibility_path, parse_dates=["date"])
+
     # Load Mom50 benchmark
     mom50_df = pd.read_csv(mom50_path, parse_dates=["Date"])
     mom50_df.set_index("Date", inplace=True)
     mom50_series = mom50_df["Close"]
 
-    return equity_df, rebalance_dates, mom50_series
+    return equity_df, rebalance_dates, mom50_series, eligibility_df
 
 
 def compute_period_returns(equity_df, mom50_series, rebalance_dates):
@@ -144,6 +150,22 @@ def compute_summary_metrics(df):
         "n_total_periods": n_total,
     }
 
+def compute_coverage_ranges(dates):
+    """Compute contiguous date ranges for coverage/exclusion reporting."""
+    if dates.empty:
+        return []
+    dates = dates.sort_values().reset_index(drop=True)
+    ranges = []
+    start = dates.iloc[0]
+    prev = dates.iloc[0]
+    for current in dates.iloc[1:]:
+        if (current - prev).days > 5:
+            ranges.append((start.date().isoformat(), prev.date().isoformat()))
+            start = current
+        prev = current
+    ranges.append((start.date().isoformat(), prev.date().isoformat()))
+    return ranges
+
 
 def interpret_results(metrics):
     """Generate plain-language interpretation."""
@@ -240,10 +262,14 @@ def main():
 
     # Load data
     print("\nLoading data...")
-    equity_df, rebalance_dates, mom50_series = load_data(output_dir, mom50_path)
+    equity_df, rebalance_dates, mom50_series, eligibility_df = load_data(output_dir, mom50_path)
     print(f"  Strategy: {len(equity_df)} trading days")
     print(f"  Rebalance periods: {len(rebalance_dates)}")
     print(f"  Mom50: {len(mom50_series)} data points")
+    if eligibility_df is None:
+        print("  Eligibility coverage: MISSING (eligibility_coverage.csv not found)")
+    else:
+        print(f"  Eligibility coverage: {len(eligibility_df)} rows")
 
     # Compute period returns
     print("\nComputing period returns aligned to rebalance dates...")
@@ -271,19 +297,82 @@ def main():
     capture_df.to_csv(csv_path, index=False, float_format="%.6f")
     print(f"\n  CSV saved: {csv_path}")
 
-    # Save summary metrics
-    json_path = output_path / "metrics_vs_comparison.json"
-    with open(json_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"  JSON saved: {json_path}")
+    # Eligibility-filtered capture ratios (eligible_stocks >= 10)
+    filtered_metrics = None
+    coverage_stats = None
+    filtered_csv_path = output_path / "capture_ratios_eligibility_filtered.csv"
+    if eligibility_df is not None:
+        elig = eligibility_df[["date", "data_eligible_count"]].copy()
+        elig["date"] = pd.to_datetime(elig["date"])
+        capture_with_elig = capture_df.merge(elig, on="date", how="left")
+        capture_with_elig["eligible_ok"] = capture_with_elig["data_eligible_count"] >= 10
+
+        filtered_df = capture_with_elig[capture_with_elig["eligible_ok"]].copy()
+        filtered_df.to_csv(filtered_csv_path, index=False, float_format="%.6f")
+
+        filtered_metrics = compute_summary_metrics(filtered_df)
+
+        included = capture_with_elig[capture_with_elig["eligible_ok"]]["date"]
+        excluded = capture_with_elig[~capture_with_elig["eligible_ok"]]["date"]
+        n_total = len(capture_with_elig)
+        coverage_stats = {
+            "n_total_periods": n_total,
+            "n_included": int(len(included)),
+            "n_excluded": int(len(excluded)),
+            "pct_included": round(len(included) / n_total * 100, 1) if n_total else 0.0,
+            "pct_excluded": round(len(excluded) / n_total * 100, 1) if n_total else 0.0,
+            "included_ranges": compute_coverage_ranges(included),
+            "excluded_ranges": compute_coverage_ranges(excluded),
+        }
+
+        print(f"\n  CSV saved: {filtered_csv_path}")
+    else:
+        print("\n  Skipping eligibility-filtered capture ratios (no eligibility_coverage.csv)")
 
     # Generate interpretation
     primary_driver = interpret_results(metrics)
 
-    # Add interpretation to metrics
-    metrics["primary_driver"] = primary_driver
+    # Append summary metrics
+    json_path = output_path / "metrics_vs_comparison.json"
+    if json_path.exists():
+        with open(json_path, "r") as f:
+            json_blob = json.load(f)
+    else:
+        json_blob = {}
+
+    json_blob["capture_ratios"] = metrics
+    json_blob["capture_ratios"]["primary_driver"] = primary_driver
+
+    if filtered_metrics is not None:
+        json_blob["capture_ratios_filtered"] = filtered_metrics
+        json_blob["capture_ratios_filtered"]["eligibility_threshold"] = 10
+        json_blob["capture_ratios_filtered"]["coverage"] = coverage_stats
+
+        # Determine structural vs sparsity-driven
+        up_raw = metrics["up_capture_ratio"]
+        down_raw = metrics["down_capture_ratio"]
+        up_f = filtered_metrics["up_capture_ratio"]
+        down_f = filtered_metrics["down_capture_ratio"]
+        if None not in (up_raw, down_raw, up_f, down_f):
+            delta_up = abs(up_raw - up_f)
+            delta_down = abs(down_raw - down_f)
+            structural = delta_up <= 0.05 and delta_down <= 0.05
+        else:
+            structural = False
+
+        json_blob["capture_ratios_filtered"]["conclusion"] = (
+            "structural" if structural else "driven_by_early_period_sparsity"
+        )
+
+        print("\nConclusion:")
+        if structural:
+            print("Capture behavior appears STRUCTURAL (filtered ratios align with raw).")
+        else:
+            print("Capture behavior appears DRIVEN BY EARLY-PERIOD UNIVERSE SPARSITY.")
+
     with open(json_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(json_blob, f, indent=2)
+    print(f"  JSON updated: {json_path}")
 
     print("\n" + "="*70)
     print("ANALYSIS COMPLETE")

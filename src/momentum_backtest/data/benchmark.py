@@ -21,10 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 # Benchmark candidates in priority order
-BENCHMARK_CANDIDATES: List[str] = [
-    "^CRSLDX",     # NIFTY 500 index (preferred if available)
-    "^NSEI",       # NIFTY 50 index (reliable fallback)
-]
+BENCHMARK_CANDIDATES: List[str] = []
 
 # Minimum coverage threshold (as fraction of expected trading days)
 MIN_COVERAGE_THRESHOLD = 0.98  # 98% coverage required
@@ -35,7 +32,7 @@ class BenchmarkResult(NamedTuple):
     ticker: str
     data: pd.Series
     coverage: float
-    is_proxy: bool  # True if using NIFTY 50 as proxy for NIFTY 500
+    is_proxy: bool  # True if using a proxy benchmark
     fallback_chain: List[str]  # Tickers tried in order
 
 
@@ -84,7 +81,7 @@ def load_benchmark_from_csv(
     ticker_name: Optional[str] = None,
 ) -> BenchmarkResult:
     """
-    Load benchmark data from a local CSV file.
+    Load benchmark data from a local CSV or parquet file.
 
     Expected CSV format:
     - First column: Date (index)
@@ -114,14 +111,38 @@ def load_benchmark_from_csv(
     if ticker_name is None:
         ticker_name = csv_path.stem.upper()
 
-    # Load CSV
-    df = pd.read_csv(csv_path, parse_dates=["Date"], index_col="Date")
+    if csv_path.suffix.lower() in (".parquet", ".pq"):
+        df = pd.read_parquet(csv_path)
+        # Normalize column names
+        cols = {c.lower(): c for c in df.columns}
+        if "date" in cols:
+            date_col = cols["date"]
+        elif "Date" in df.columns:
+            date_col = "Date"
+        else:
+            raise ValueError(f"Parquet must have a 'date' column. Found: {df.columns.tolist()}")
 
-    if "Close" not in df.columns:
-        raise ValueError(f"CSV must have a 'Close' column. Found: {df.columns.tolist()}")
+        if "close" in cols:
+            close_col = cols["close"]
+        elif "adj_close" in cols:
+            close_col = cols["adj_close"]
+        else:
+            raise ValueError(
+                f"Parquet must have a 'close' or 'adj_close' column. Found: {df.columns.tolist()}"
+            )
 
-    # Extract Close prices as Series
-    data = df["Close"].sort_index()
+        df[date_col] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
+        df = df.set_index(date_col)
+        data = df[close_col].sort_index()
+    else:
+        # Load CSV
+        df = pd.read_csv(csv_path, parse_dates=["Date"], index_col="Date")
+
+        if "Close" not in df.columns:
+            raise ValueError(f"CSV must have a 'Close' column. Found: {df.columns.tolist()}")
+
+        # Extract Close prices as Series
+        data = df["Close"].sort_index()
 
     # Filter to date range (with buffer for lookback)
     buffer_start = start_date - timedelta(days=365)  # 1 year buffer for momentum calc
@@ -176,6 +197,9 @@ def get_benchmark_data(
     if candidates is None:
         candidates = BENCHMARK_CANDIDATES.copy()
 
+    if not candidates:
+        raise RuntimeError("No benchmark candidates configured. Provide a local benchmark file.")
+
     logger.info(f"Selecting benchmark from candidates: {candidates}")
 
     # Track which candidates we tried (for audit report)
@@ -196,8 +220,8 @@ def get_benchmark_data(
         coverage = _check_benchmark_coverage(data, start_date, end_date)
         logger.info(f"{ticker}: coverage = {coverage:.1%} ({len(data)} days)")
 
-        # Determine if this is a proxy (NIFTY 50 instead of NIFTY 500)
-        is_proxy = ticker == "^NSEI"
+        # Determine if this is a proxy benchmark (fallback)
+        is_proxy = False
 
         result = BenchmarkResult(
             ticker=ticker,
@@ -210,11 +234,6 @@ def get_benchmark_data(
         # If coverage meets threshold, use this one
         if coverage >= MIN_COVERAGE_THRESHOLD:
             logger.info(f"Selected benchmark: {ticker} (coverage: {coverage:.1%})")
-            if is_proxy:
-                logger.warning(
-                    f"Using {ticker} (NIFTY 50) as proxy for NIFTY 500. "
-                    "This may introduce tracking error."
-                )
             return result
 
         # Track best so far
@@ -228,11 +247,6 @@ def get_benchmark_data(
             f"No benchmark met {MIN_COVERAGE_THRESHOLD:.0%} coverage threshold. "
             f"Using {best_result.ticker} with {best_result.coverage:.1%} coverage."
         )
-        if best_result.is_proxy:
-            logger.warning(
-                f"Using {best_result.ticker} (NIFTY 50) as proxy for NIFTY 500. "
-                "This may introduce tracking error."
-            )
         # Update fallback_chain to include all tried candidates
         return BenchmarkResult(
             ticker=best_result.ticker,
